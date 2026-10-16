@@ -104,6 +104,7 @@ def test_prompt_mentions_accent_opt_out_and_placeholder():
     assert "North Shore" not in system
     assert "University of Sydney" in system
     assert "AI for Owners" in system
+    assert "UiPath integration and audits" in system
     assert "Australian Privacy Principles" in system
     assert "adam@tack45.com.au" in system
     assert "tack45-website.pages.dev" in system

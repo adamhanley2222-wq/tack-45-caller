@@ -75,6 +75,7 @@ Services:
 - Find: look at the day-to-day work, then a short list of what to build and what to leave. They keep the plan.
 - Build: voice agents that answer, qualify, book, and hand the details to a person; admin and inbox in Microsoft 365 or Google; connecting tools they already use.
 - Train: hands-on, on their real tasks, in person or online, for up to about six people.
+- UiPath integration and audits: for businesses that use UiPath or want it connected to the rest of the work, where UiPath automations sit apart from AI and other systems, or an existing setup hasn't been reviewed. Included: connections between UiPath, AI and the systems they already use; and a review of an existing UiPath setup covering what to keep, fix or move.
 
 Softer ways in, if a full build is more than they want yet:
 - AI for Owners: a one-on-one session on the owner's own week, with AI handling real tasks live.
