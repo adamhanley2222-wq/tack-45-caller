@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.amd import amd_end_reason, decide_amd
 from app.config import Settings, missing_dial_configuration
-from app.db import public_call
+from app.db import FINAL_TWILIO_STATUSES, public_call
 from app import guards
 from app.phones import PhoneError, infer_timezone, normalize_phone, validate_timezone
 from app.prompts import first_name_from, inbound_opener, load_text, render_instructions, render_opener
@@ -20,6 +20,7 @@ from app.providers import SessionPlan, build_session_plan
 from app.realtime_ws import default_provider_factory
 from app.relay import RelayController, run_relay
 from app.signatures import signature_is_valid
+from app.transcript_webhook import schedule_transcript_webhook
 from app.twiml import (
     connect_stream_twiml,
     hangup_twiml,
@@ -284,6 +285,7 @@ async def create_call(request: Request) -> JSONResponse:
         )
     except Exception as exc:
         await request.app.state.db.mark_failed(call_id, "twilio_error")
+        schedule_transcript_webhook(request.app, call_id)
         logger.exception("Twilio create failed for %s", call_id)
         raise APIError(502, "twilio_error", str(exc)) from exc
 
@@ -384,6 +386,10 @@ async def twilio_status(request: Request) -> Response:
     if not found:
         logger.warning("Status webhook for unknown CallSid %s", call_sid)
         return Response(status_code=404)
+    if status in FINAL_TWILIO_STATUSES:
+        call = await request.app.state.db.get_by_sid(call_sid)
+        if call is not None:
+            schedule_transcript_webhook(request.app, call["id"])
     return Response(status_code=204)
 
 
@@ -467,12 +473,14 @@ async def media_stream(websocket: WebSocket, token: str) -> None:
     settings: Settings = websocket.app.state.settings
     if _call_finished(call):
         await websocket.app.state.prewarm.discard(call["id"])
+        await _release_stream(websocket.app, call["id"])
         await websocket.close(code=1000)
         return
     try:
         opener, plan = await script_for_call(settings, websocket.app.state.db, call)
     except FileNotFoundError:
         logger.exception("Prompt file missing.")
+        await _release_stream(websocket.app, call["id"])
         await websocket.close(code=1011)
         return
     provider, setup_sent = await _take_provider(websocket.app, settings, call, plan)
@@ -486,6 +494,7 @@ async def media_stream(websocket: WebSocket, token: str) -> None:
         setup_sent=setup_sent,
     )
     try:
+        await websocket.app.state.db.mark_stream_open(call["id"])
         await run_relay(
             twilio_ws=websocket,
             provider=provider,
@@ -496,6 +505,17 @@ async def media_stream(websocket: WebSocket, token: str) -> None:
     except Exception:
         logger.exception("Media relay ended with an error for %s", call["id"])
         await websocket.close(code=1011)
+    finally:
+        await _release_stream(websocket.app, call["id"])
+
+
+async def _release_stream(app, call_id: str) -> None:
+    """The media socket is done. Post the transcript if the call is already final."""
+    try:
+        await app.state.db.mark_stream_closed(call_id)
+    except Exception:
+        logger.exception("Failed to mark the media stream closed for %s", call_id)
+    schedule_transcript_webhook(app, call_id)
 
 
 def _signed(request: Request, settings: Settings, form: dict[str, str]) -> bool:

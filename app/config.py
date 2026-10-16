@@ -57,6 +57,11 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Empty disables the finished-call webhook.
+    transcript_webhook_url: str = ""
+    transcript_webhook_secret: str = ""
+    transcript_webhook_auth_header: str = "Authorization"
+
 
 def missing_dial_configuration(settings: Settings) -> list[str]:
     """Names of settings that must be present before a call is placed."""

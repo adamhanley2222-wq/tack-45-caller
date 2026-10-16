@@ -97,6 +97,8 @@ SQLite at `SQLITE_PATH` (default `data/calls.db`) unless `DATABASE_URL` is set. 
 
 Each call row stores `direction` (`outbound` or `inbound`), `call_sid`, both numbers, AMD result, provider, timestamps, duration, end reason, opt-out, and a transcript with `assistant` and `caller` lines.
 
+When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The body is the call id, sid, direction, both numbers, name, business, notes, provider, status, AMD result, end reason, opt-out, duration, timestamps, and the transcript. Delivery waits until the media stream has closed, runs in the background with a 10 second timeout, and retries up to three times. A delivery failure is logged and does not affect the call. `TRANSCRIPT_WEBHOOK_SECRET` is optional. With the default `TRANSCRIPT_WEBHOOK_AUTH_HEADER=Authorization` it is sent as `Bearer <secret>`; any other header name sends the raw secret.
+
 ## Environment variables
 
 | Variable | Required to dial | Purpose |
@@ -133,6 +135,9 @@ Each call row stores `direction` (`outbound` or `inbound`), `call_sid`, both num
 | `MACHINE_DETECTION_TIMEOUT` | no | Twilio `MachineDetectionTimeout`. Default 30 |
 | `HANGUP_GRACE_SECONDS` | no | Extra wait after playback before the hangup watchdog. Default 8 |
 | `LOG_LEVEL` | no | Default `INFO` |
+| `TRANSCRIPT_WEBHOOK_URL` | no | Where to POST each finished call. Empty disables the feature |
+| `TRANSCRIPT_WEBHOOK_SECRET` | no | Secret sent with that POST. Empty sends no auth header |
+| `TRANSCRIPT_WEBHOOK_AUTH_HEADER` | no | Header name for the secret. Default `Authorization`, which sends `Bearer <secret>`. Any other name sends the raw secret |
 
 The service boots and serves `/health` without these. `POST /calls` returns 503 until the dial settings for the selected provider are present.
 

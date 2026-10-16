@@ -15,6 +15,7 @@ from app.config import Settings
 from app.db import Database
 from app.prewarm import PrewarmPool
 from app.realtime_ws import default_provider_factory
+from app.transcript_webhook import cancel_webhook_tasks
 from app.twilio_gateway import TwilioGateway
 
 
@@ -37,9 +38,11 @@ def create_app(
         app.state.gateway = TwilioGateway(settings, client)
         app.state.provider_factory = provider_factory or default_provider_factory
         app.state.prewarm = PrewarmPool()
+        app.state.webhook_tasks = set()
         try:
             yield
         finally:
+            await cancel_webhook_tasks(app.state.webhook_tasks)
             await app.state.prewarm.aclose()
             await client.aclose()
             await database.dispose()

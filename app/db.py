@@ -49,7 +49,9 @@ _STATUS_RANK = {
     "canceled": 7,
     "refused": 7,
 }
-_TERMINAL_TWILIO = {"completed", "busy", "failed", "no-answer", "canceled"}
+# Twilio's terminal call statuses. A transcript webhook waits for one of these.
+FINAL_TWILIO_STATUSES = {"completed", "busy", "failed", "no-answer", "canceled"}
+_TERMINAL_TWILIO = FINAL_TWILIO_STATUSES
 _TERMINAL_CALL = _TERMINAL_TWILIO | {"machine", "refused"}
 
 
@@ -95,6 +97,12 @@ class CallRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Armed Connect TwiML has not attached a media socket yet.
+    stream_pending: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    # The media socket is open. The transcript is not final until this clears.
+    stream_open: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    # One successful claim per call, so the transcript webhook is posted once.
+    transcript_posted: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
 
 
 class OptOutRow(Base):
@@ -178,6 +186,9 @@ def call_to_dict(row: CallRow) -> dict[str, Any]:
         "created_at": _iso(row.created_at),
         "answered_at": _iso(row.answered_at),
         "ended_at": _iso(row.ended_at),
+        "stream_pending": bool(row.stream_pending),
+        "stream_open": bool(row.stream_open),
+        "transcript_posted": bool(row.transcript_posted),
     }
 
 
@@ -210,23 +221,50 @@ def public_call(row: dict[str, Any], *, include_stream_token: bool = False) -> d
     return payload
 
 
-def ensure_call_direction(sync_conn) -> None:
-    """Add ``direction`` to a calls table created before inbound callbacks.
+def webhook_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """JSON body posted when a call is finished and its transcript is final."""
+    return {
+        "id": row["id"],
+        "call_sid": row["call_sid"],
+        "direction": row.get("direction") or "outbound",
+        "to": row["to_number"],
+        "from": row.get("from_number") or "",
+        "name": row["name"],
+        "business": row["business"],
+        "notes": row["notes"],
+        "provider": row["provider"],
+        "status": row["status"],
+        "amd_result": row["amd_result"],
+        "end_reason": row["end_reason"],
+        "opted_out": row["opted_out"],
+        "opt_out_reason": row["opt_out_reason"],
+        "duration_seconds": row["duration_seconds"],
+        "created_at": row["created_at"],
+        "answered_at": row["answered_at"],
+        "ended_at": row["ended_at"],
+        "transcript": row["transcript"],
+    }
 
-    ``create_all`` does not alter an existing table. Railway Postgres already
-    has ``calls`` from outbound dialling, so the column is added on startup.
-    """
+
+# Columns added after the first deploy. create_all does not alter an existing table.
+_ADDED_CALL_COLUMNS = {
+    "direction": "VARCHAR(16) NOT NULL DEFAULT 'outbound'",
+    "stream_pending": "INTEGER NOT NULL DEFAULT 0",
+    "stream_open": "INTEGER NOT NULL DEFAULT 0",
+    "transcript_posted": "INTEGER NOT NULL DEFAULT 0",
+}
+
+
+def ensure_call_columns(sync_conn) -> None:
+    """Add columns that existing Railway databases will not get from create_all."""
     inspector = inspect(sync_conn)
     if not inspector.has_table("calls"):
         return
     columns = {column["name"] for column in inspector.get_columns("calls")}
-    if "direction" in columns:
-        return
-    sync_conn.execute(
-        text(
-            "ALTER TABLE calls ADD COLUMN direction VARCHAR(16) NOT NULL DEFAULT 'outbound'"
-        )
-    )
+    for name, ddl in _ADDED_CALL_COLUMNS.items():
+        if name in columns:
+            continue
+        sync_conn.execute(text(f"ALTER TABLE calls ADD COLUMN {name} {ddl}"))
 
 
 def load_dnc_file(path: str) -> set[str]:
@@ -277,7 +315,7 @@ class Database:
     async def connect(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            await conn.run_sync(ensure_call_direction)
+            await conn.run_sync(ensure_call_columns)
         await self.sync_dnc_file()
 
     async def dispose(self) -> None:
@@ -468,6 +506,7 @@ class Database:
                 row.status = "streaming"
             if row.answered_at is None:
                 row.answered_at = _utcnow()
+            row.stream_pending = 1
             await session.commit()
 
     async def mark_in_progress(self, call_id: str) -> None:
@@ -602,6 +641,45 @@ class Database:
                         row.duration_seconds = max(0, int((ended - answered).total_seconds()))
             await session.commit()
             return True
+
+    async def mark_stream_open(self, call_id: str) -> None:
+        """The media socket is attached. The transcript is still being written."""
+        async with self._begin() as session:
+            row = await session.get(CallRow, call_id)
+            if row is None:
+                return
+            row.stream_open = 1
+            row.stream_pending = 0
+            await session.commit()
+
+    async def mark_stream_closed(self, call_id: str) -> None:
+        """The media socket is gone, so the stored transcript will not grow."""
+        async with self._begin() as session:
+            row = await session.get(CallRow, call_id)
+            if row is None:
+                return
+            row.stream_open = 0
+            row.stream_pending = 0
+            await session.commit()
+
+    async def claim_transcript_webhook(self, call_id: str, *, allow_open: bool = False) -> dict[str, Any] | None:
+        """Reserve the one webhook for this call and return its JSON body.
+
+        A second claim returns None. An open media stream also returns None
+        unless the caller has given up waiting for it to close.
+        """
+        async with self._begin() as session:
+            row = await session.get(CallRow, call_id)
+            if row is None or row.transcript_posted:
+                return None
+            if row.status not in FINAL_TWILIO_STATUSES:
+                return None
+            if row.stream_open and not allow_open:
+                return None
+            row.transcript_posted = 1
+            await session.commit()
+            await session.refresh(row)
+            return webhook_payload(call_to_dict(row))
 
     async def delete_file_sourced_for_tests(self) -> None:
         async with self._begin() as session:
