@@ -45,6 +45,9 @@ class Settings(BaseSettings):
 
     prompt_path: str = "prompts/system.txt"
     opener_path: str = "prompts/compliance_opener.txt"
+    inbound_prompt_path: str = "prompts/inbound_system.txt"
+    # How far back an inbound caller is matched to an outbound call. 0 keeps all.
+    inbound_lookup_days: int = 90
     # Empty means hang up on an answering machine. Any text is spoken, then the call ends.
     machine_message: str = ""
     # No longer delays the greeting. The stream starts on answer; AMD hangs up machines later.

@@ -8,13 +8,14 @@ import secrets
 from uuid import uuid4
 from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy.exc import IntegrityError
 
 from app.amd import amd_end_reason, decide_amd
 from app.config import Settings, missing_dial_configuration
 from app.db import public_call
 from app import guards
 from app.phones import PhoneError, infer_timezone, normalize_phone, validate_timezone
-from app.prompts import first_name_from, load_text, render_instructions, render_opener
+from app.prompts import first_name_from, inbound_opener, load_text, render_instructions, render_opener
 from app.providers import SessionPlan, build_session_plan
 from app.realtime_ws import default_provider_factory
 from app.relay import RelayController, run_relay
@@ -90,6 +91,50 @@ def prepare_script(settings: Settings, call: dict) -> tuple[str, SessionPlan]:
         first_name=first_name_from(call.get("name") or ""),
     )
     return opener, build_session_plan(settings, instructions, opener)
+
+
+def prepare_inbound_script(
+    settings: Settings,
+    call: dict,
+    match: dict | None,
+) -> tuple[str, SessionPlan]:
+    """Opener and session for a call the person placed to us."""
+    source = match or {}
+    name = source.get("name") or ""
+    opener = inbound_opener(name, known=match is not None)
+    template = load_text(settings.inbound_prompt_path)
+    instructions = render_instructions(
+        template,
+        opener=opener,
+        name=name,
+        business=source.get("business") or "",
+        notes=source.get("notes") or "",
+        number=call.get("from_number") or "",
+        first_name=first_name_from(name),
+        callback="yes" if match is not None else "no",
+    )
+    return opener, build_session_plan(settings, instructions, opener)
+
+
+async def script_for_call(settings: Settings, db, call: dict) -> tuple[str, SessionPlan]:
+    """Outbound uses the compliance opener. Inbound uses the callback prompt."""
+    if call.get("direction") == "inbound":
+        caller = call.get("from_number") or ""
+        match = None
+        if caller.startswith("+"):
+            match = await db.latest_outbound_to(
+                caller,
+                within_days=settings.inbound_lookup_days,
+            )
+        return prepare_inbound_script(settings, call, match)
+    return prepare_script(settings, call)
+
+
+def relay_phone(call: dict) -> str:
+    """Number an opt-out should block. Inbound that is the caller, not us."""
+    if call.get("direction") == "inbound":
+        return call.get("from_number") or ""
+    return call.get("to_number") or ""
 
 
 def _stream_is_live(call: dict) -> bool:
@@ -342,6 +387,75 @@ async def twilio_status(request: Request) -> Response:
     return Response(status_code=204)
 
 
+@router.post("/twilio/inbound")
+async def twilio_inbound(request: Request) -> Response:
+    """Answer a call to our number. No AMD and no calling-hours check."""
+    settings: Settings = request.app.state.settings
+    form = await read_form(request)
+    if not _signed(request, settings, form):
+        return JSONResponse(status_code=403, content={"detail": "Invalid Twilio signature."})
+    call_sid = (form.get("CallSid") or "").strip()
+    if not call_sid:
+        return xml(hangup_twiml())
+
+    db = request.app.state.db
+    existing = await db.get_by_sid(call_sid)
+    if existing is not None:
+        if _call_finished(existing):
+            return xml(hangup_twiml())
+        return xml(_connect_twiml(settings, existing))
+
+    caller = _stored_caller(form.get("From") or "")
+    ours = _stored_caller(form.get("To") or "") or settings.twilio_from_number
+    match = None
+    if caller.startswith("+"):
+        match = await db.latest_outbound_to(caller, within_days=settings.inbound_lookup_days)
+    if match:
+        name = match.get("name") or ""
+        business = match.get("business") or ""
+        notes = match.get("notes") or ""
+        timezone_name = match.get("timezone") or settings.default_timezone
+    else:
+        name = ""
+        business = ""
+        notes = ""
+        timezone_name = _caller_timezone(settings, caller)
+
+    call_id = str(uuid4())
+    token = secrets.token_urlsafe(32)
+    try:
+        call = await db.create_call(
+            {
+                "id": call_id,
+                "call_sid": call_sid,
+                "stream_token": token,
+                "direction": "inbound",
+                "to_number": ours,
+                "from_number": caller,
+                "name": name,
+                "business": business,
+                "notes": notes,
+                "timezone": timezone_name,
+                "provider": settings.voice_provider.strip().lower(),
+                "status": "answered",
+            }
+        )
+    except IntegrityError:
+        existing = await db.get_by_sid(call_sid)
+        if existing is None or _call_finished(existing):
+            return xml(hangup_twiml())
+        return xml(_connect_twiml(settings, existing))
+
+    logger.info(
+        "Inbound call %s from %s sid %s callback=%s",
+        call_id,
+        caller,
+        call_sid,
+        "yes" if match else "no",
+    )
+    return xml(await _arm_stream(request, call))
+
+
 @router.websocket("/streams/media/{token}")
 async def media_stream(websocket: WebSocket, token: str) -> None:
     # Token travels in the path: Twilio strips query strings from <Stream url>.
@@ -356,7 +470,7 @@ async def media_stream(websocket: WebSocket, token: str) -> None:
         await websocket.close(code=1000)
         return
     try:
-        opener, plan = prepare_script(settings, call)
+        opener, plan = await script_for_call(settings, websocket.app.state.db, call)
     except FileNotFoundError:
         logger.exception("Prompt file missing.")
         await websocket.close(code=1011)
@@ -365,7 +479,7 @@ async def media_stream(websocket: WebSocket, token: str) -> None:
     controller = RelayController(
         call_id=call["id"],
         call_sid=call["call_sid"],
-        phone=call["to_number"],
+        phone=relay_phone(call),
         opener=opener,
         plan=plan,
         hangup_grace_seconds=settings.hangup_grace_seconds,
@@ -476,12 +590,30 @@ def _call_finished(call: dict) -> bool:
     return (call.get("end_reason") or "").startswith("amd_")
 
 
+def _stored_caller(raw: str) -> str:
+    """E.164 when we can read it. Otherwise a short raw value, never our lookup key."""
+    try:
+        return normalize_phone(raw)
+    except PhoneError:
+        return raw.strip()[:20]
+
+
+def _caller_timezone(settings: Settings, caller: str) -> str:
+    if not caller.startswith("+"):
+        return settings.default_timezone
+    try:
+        zone, _warning = infer_timezone(caller, settings.default_timezone)
+    except PhoneError:
+        return settings.default_timezone
+    return zone
+
+
 async def _arm_stream(request: Request, call: dict) -> str:
-    """Connect media now and start the realtime session without waiting for AMD."""
+    """Connect media now and start the realtime session before TwiML returns."""
     settings: Settings = request.app.state.settings
     await request.app.state.db.mark_streaming(call["id"])
     await _prewarm_session(request, call)
-    logger.info("Armed media stream for %s before AMD", call["id"])
+    logger.info("Armed media stream for %s", call["id"])
     return _connect_twiml(settings, call)
 
 
@@ -489,7 +621,7 @@ async def _prewarm_session(request: Request, call: dict) -> None:
     """Start the provider handshake. Do not await it: TwiML must return now."""
     settings: Settings = request.app.state.settings
     try:
-        _opener, plan = prepare_script(settings, call)
+        _opener, plan = await script_for_call(settings, request.app.state.db, call)
     except FileNotFoundError:
         logger.exception("Prompt file missing; the stream will open the session itself.")
         return

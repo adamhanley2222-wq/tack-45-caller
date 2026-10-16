@@ -1,6 +1,6 @@
 # tack45-caller
 
-Outbound AI voice calls for Tack45, a Sydney AI consultancy. The service dials an Australian business on a Twilio number, waits for async answering-machine detection, and on a human answer bridges the call to a realtime speech-to-speech model. Audio stays 8 kHz G.711 μ-law from Twilio to the model and back. Nothing is resampled or transcoded.
+Outbound AI voice calls for Tack45, a Sydney AI consultancy. The service dials an Australian business on a Twilio number, waits for async answering-machine detection, and on a human answer bridges the call to a realtime speech-to-speech model. The same relay answers inbound calls to that number. Audio stays 8 kHz G.711 μ-law from Twilio to the model and back. Nothing is resampled or transcoded.
 
 The sales script is a placeholder. Compliance behaviour is already in place: a short identity check, then an AI disclosure and Tack45 identification before any pitch, an Australian accent instruction, calling-hours and do-not-call guards, and an opt-out tool.
 
@@ -95,7 +95,7 @@ Barge-in is suppressed while the opener is still playing, so the disclosure is n
 
 SQLite at `SQLITE_PATH` (default `data/calls.db`) unless `DATABASE_URL` is set. A Railway `postgres://` URL is rewritten for asyncpg, and `sslmode=require` becomes an SSL connection.
 
-Each call row stores `call_sid`, destination, AMD result, provider, timestamps, duration, end reason, opt-out, and a transcript with `assistant` and `caller` lines.
+Each call row stores `direction` (`outbound` or `inbound`), `call_sid`, both numbers, AMD result, provider, timestamps, duration, end reason, opt-out, and a transcript with `assistant` and `caller` lines.
 
 ## Environment variables
 
@@ -126,6 +126,8 @@ Each call row stores `call_sid`, destination, AMD result, provider, timestamps, 
 | `DEFAULT_TIMEZONE` | no | Default `Australia/Sydney` |
 | `PROMPT_PATH` | no | Default `prompts/system.txt` |
 | `OPENER_PATH` | no | Default `prompts/compliance_opener.txt` |
+| `INBOUND_PROMPT_PATH` | no | Default `prompts/inbound_system.txt` |
+| `INBOUND_LOOKUP_DAYS` | no | Match a caller to an outbound call from the last N days. Default 90. `0` keeps all |
 | `MACHINE_MESSAGE` | no | Empty hangs up on machines. Otherwise spoken, then hangup |
 | `AMD_HOLD_SECONDS` | no | Unused. The greeting is not held for AMD. Default 60 |
 | `MACHINE_DETECTION_TIMEOUT` | no | Twilio `MachineDetectionTimeout`. Default 30 |
@@ -134,11 +136,21 @@ Each call row stores `call_sid`, destination, AMD result, provider, timestamps, 
 
 The service boots and serves `/health` without these. `POST /calls` returns 503 until the dial settings for the selected provider are present.
 
+## Inbound calls
+
+Set the number's "A call comes in" webhook to `POST {PUBLIC_BASE_URL}/twilio/inbound`. That URL has to be exactly `PUBLIC_BASE_URL` plus `/twilio/inbound`, because signature checks use `PUBLIC_BASE_URL` rather than the request host.
+
+There is no answering-machine detection and no calling-hours check. A do-not-call entry does not block the person from calling us. If they opt out during the call, `record_opt_out` still stores their number and later outbound dials are refused.
+
+The opener is in the inbound prompt. When the caller's number matches an outbound call from the last `INBOUND_LOOKUP_DAYS` (default 90) that was actually placed, the relay is given that call's name, business, and notes, and the opener thanks them for calling back. Refused outbound attempts are not a match. An unknown caller hears that this is an AI assistant for Tack45 and is asked how we can help or whether to leave a message. The same rules apply as outbound: no prices, no client results or ROI, and the call to action is a free 60-minute chat with Adam.
+
+A status callback on the number is optional: `POST {PUBLIC_BASE_URL}/twilio/status`. The relay already stores duration from `answered_at` when the stream ends.
+
 ## Twilio configuration
 
-Outbound calls set their own webhooks. You do not need a "call comes in" URL on the number for this service.
+Outbound calls set their own answer, AMD, and status webhooks. Inbound calls use the number's "A call comes in" webhook above.
 
-1. In the Twilio console, confirm `+61290904464` is a voice-capable number on the account that owns `TWILIO_ACCOUNT_SID`.
+1. In the Twilio console, confirm `+61290904464` is a voice-capable number on the account that owns `TWILIO_ACCOUNT_SID`. Set "A call comes in" to HTTP POST `{PUBLIC_BASE_URL}/twilio/inbound`.
 2. Create a standard API key. Put the sid and secret in `TWILIO_API_KEY_SID` and `TWILIO_API_KEY_SECRET`.
 3. Voice geographic permissions must allow calls to Australia.
 4. Deploy so `PUBLIC_BASE_URL` is the public `https` origin (no trailing path).

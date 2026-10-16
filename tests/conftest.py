@@ -29,6 +29,7 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         do_not_call_path=str(tmp_path / "do_not_call.txt"),
         prompt_path=str(ROOT / "prompts" / "system.txt"),
         opener_path=str(ROOT / "prompts" / "compliance_opener.txt"),
+        inbound_prompt_path=str(ROOT / "prompts" / "inbound_system.txt"),
         machine_message="",
         default_timezone="Australia/Sydney",
     )

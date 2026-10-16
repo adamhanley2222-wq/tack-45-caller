@@ -10,11 +10,11 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import DateTime, Integer, String, Text, delete, select
+from sqlalchemy import DateTime, Integer, String, Text, delete, inspect, select, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.pool import NullPool
 from sqlalchemy.ext.asyncio import (
@@ -75,6 +75,9 @@ class CallRow(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     call_sid: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
     stream_token: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    direction: Mapped[str] = mapped_column(
+        String(16), default="outbound", server_default=text("'outbound'")
+    )
     to_number: Mapped[str] = mapped_column(String(20), index=True)
     from_number: Mapped[str] = mapped_column(String(20), default="")
     name: Mapped[str] = mapped_column(String(200), default="")
@@ -157,6 +160,7 @@ def call_to_dict(row: CallRow) -> dict[str, Any]:
         "id": row.id,
         "call_sid": row.call_sid,
         "stream_token": row.stream_token,
+        "direction": row.direction or "outbound",
         "to_number": row.to_number,
         "from_number": row.from_number,
         "name": row.name,
@@ -182,7 +186,9 @@ def public_call(row: dict[str, Any], *, include_stream_token: bool = False) -> d
     payload = {
         "id": row["id"],
         "call_sid": row["call_sid"],
+        "direction": row.get("direction") or "outbound",
         "to": row["to_number"],
+        "from": row.get("from_number") or "",
         "name": row["name"],
         "business": row["business"],
         "notes": row["notes"],
@@ -202,6 +208,25 @@ def public_call(row: dict[str, Any], *, include_stream_token: bool = False) -> d
     if include_stream_token:
         payload["stream_token"] = row["stream_token"]
     return payload
+
+
+def ensure_call_direction(sync_conn) -> None:
+    """Add ``direction`` to a calls table created before inbound callbacks.
+
+    ``create_all`` does not alter an existing table. Railway Postgres already
+    has ``calls`` from outbound dialling, so the column is added on startup.
+    """
+    inspector = inspect(sync_conn)
+    if not inspector.has_table("calls"):
+        return
+    columns = {column["name"] for column in inspector.get_columns("calls")}
+    if "direction" in columns:
+        return
+    sync_conn.execute(
+        text(
+            "ALTER TABLE calls ADD COLUMN direction VARCHAR(16) NOT NULL DEFAULT 'outbound'"
+        )
+    )
 
 
 def load_dnc_file(path: str) -> set[str]:
@@ -252,6 +277,7 @@ class Database:
     async def connect(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(ensure_call_direction)
         await self.sync_dnc_file()
 
     async def dispose(self) -> None:
@@ -298,6 +324,7 @@ class Database:
             id=fields["id"],
             call_sid=fields.get("call_sid"),
             stream_token=fields["stream_token"],
+            direction=fields.get("direction") or "outbound",
             to_number=fields["to_number"],
             from_number=fields.get("from_number") or "",
             name=fields.get("name") or "",
@@ -343,6 +370,37 @@ class Database:
             row = (
                 await session.execute(
                     select(CallRow).where(CallRow.stream_token == token)
+                )
+            ).scalar_one_or_none()
+            return call_to_dict(row) if row else None
+
+    async def latest_outbound_to(
+        self,
+        number: str,
+        *,
+        within_days: int = 90,
+    ) -> dict[str, Any] | None:
+        """Newest outbound call we actually placed to this number.
+
+        Refused attempts and inbound rows are ignored. ``within_days`` of 0
+        keeps every placed call.
+        """
+        if not number:
+            return None
+        async with self._begin() as session:
+            query = (
+                select(CallRow)
+                .where(CallRow.to_number == number)
+                .where(CallRow.direction == "outbound")
+                .where(CallRow.call_sid.is_not(None))
+                .where(CallRow.status != "refused")
+            )
+            if within_days > 0:
+                cutoff = _utcnow() - timedelta(days=within_days)
+                query = query.where(CallRow.created_at >= cutoff)
+            row = (
+                await session.execute(
+                    query.order_by(CallRow.created_at.desc()).limit(1)
                 )
             ).scalar_one_or_none()
             return call_to_dict(row) if row else None

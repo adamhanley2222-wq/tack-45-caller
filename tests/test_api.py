@@ -54,6 +54,8 @@ def test_create_call_uses_async_amd_and_api_key(client, monkeypatch):
     body = response.json()
     assert body["call_sid"].startswith("CA")
     assert body["to"] == "+61412345678"
+    assert body["from"] == "+61290904464"
+    assert body["direction"] == "outbound"
     assert body["provider"] == "grok"
     assert body["timezone"] == "Australia/Sydney"
     assert body["timezone_warning"]
