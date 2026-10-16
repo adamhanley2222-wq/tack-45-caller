@@ -107,7 +107,15 @@ def test_prompt_mentions_accent_opt_out_and_placeholder():
     assert "record_opt_out" in system
     assert "end_call" in system
     assert "I'm an AI assistant calling for Tack45, a Sydney-based AI consultancy" in system
-    assert "free 60-minute chat with Adam" in system
+    assert "free 60-minute chat with Adam" not in system
+    assert "Would that be worth an hour?" not in system
+    assert (
+        "Would you be open to a chat with Adam, just to talk it through? "
+        "No cost, and you'll come away with at least one useful idea."
+    ) in system
+    assert "Up to an hour, and there's no cost." in system
+    assert "Would it help to talk that through with Adam?" in system
+    assert "Ask at most twice" in system
     assert "Do not mention prices" in system
     assert "Do not claim client results" in system
     assert "removed from the call list" in system

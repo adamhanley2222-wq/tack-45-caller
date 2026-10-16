@@ -164,6 +164,12 @@ def call_to_dict(row: CallRow) -> dict[str, Any]:
         transcript = json.loads(row.transcript_json or "[]")
     except json.JSONDecodeError:
         transcript = []
+    transcript = [
+        {key: value for key, value in line.items() if key != "utterance_id"}
+        if isinstance(line, dict)
+        else line
+        for line in transcript
+    ]
     return {
         "id": row.id,
         "call_sid": row.call_sid,
@@ -219,6 +225,37 @@ def public_call(row: dict[str, Any], *, include_stream_token: bool = False) -> d
     if include_stream_token:
         payload["stream_token"] = row["stream_token"]
     return payload
+
+
+def _merge_transcript_line(current: list, line: dict[str, Any]) -> None:
+    """Keep one row per utterance. A longer final replaces its interim text."""
+    utterance_id = line.get("utterance_id")
+    if utterance_id:
+        for existing in current:
+            if existing.get("utterance_id") == utterance_id and existing.get("role") == line.get("role"):
+                if existing.get("text") == line.get("text"):
+                    return
+                existing["text"] = line.get("text")
+                if line.get("at"):
+                    existing["at"] = line["at"]
+                return
+    if current:
+        last = current[-1]
+        text = line.get("text") or ""
+        if last.get("role") == line.get("role") and last.get("text") == text:
+            return
+        if (
+            last.get("role") == line.get("role")
+            and last.get("utterance_id")
+            and text.startswith(last.get("text") or "")
+        ):
+            last["text"] = text
+            if line.get("at"):
+                last["at"] = line["at"]
+            if utterance_id:
+                last["utterance_id"] = utterance_id
+            return
+    current.append(line)
 
 
 def webhook_payload(row: dict[str, Any]) -> dict[str, Any]:
@@ -532,7 +569,8 @@ class Database:
                 current = json.loads(row.transcript_json or "[]")
             except json.JSONDecodeError:
                 current = []
-            current.extend(lines)
+            for line in lines:
+                _merge_transcript_line(current, line)
             row.transcript_json = json.dumps(current)
             await session.commit()
 

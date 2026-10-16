@@ -140,7 +140,9 @@ class RelayController:
         self.opt_out_reason = ""
         self.transcript: list[dict] = []
         self.user_partials: dict[str, str] = {}
+        self._open_user_id: str | None = None
         self.assistant_parts: list[str] = []
+        self._assistant_utterance_id: str | None = None
         self.pending_tools: list[dict] = []
         self.seen_tool_ids: set[str] = set()
         self.response_first_audio_at: float | None = None
@@ -257,6 +259,9 @@ class RelayController:
         )
 
     def _on_speech_started(self) -> StepResult:
+        # The next caller audio is a new utterance. A late final for the
+        # previous one still matches on its own item id.
+        self._open_user_id = None
         now = self.clock()
         if self.protecting_opener and (
             self.opener_protect_until == 0.0 or now < self.opener_protect_until
@@ -274,12 +279,15 @@ class RelayController:
         )
 
     def _on_user_transcript(self, norm: NormalizedEvent) -> StepResult:
-        item_id = norm.item_id or self._next_partial_id()
+        item_id = self._caller_utterance_id(norm.item_id)
         if norm.final:
             text = norm.text or self.user_partials.pop(item_id, "")
             self.user_partials.pop(item_id, None)
-            line = self._commit("caller", text)
+            if self._open_user_id == item_id:
+                self._open_user_id = None
+            line = self._commit("caller", text, utterance_id=item_id)
             return StepResult(transcripts=[line] if line else [])
+        # Interim fragments stay in the buffer. Only the final text is stored.
         if norm.cumulative:
             self.user_partials[item_id] = norm.text
         else:
@@ -289,7 +297,8 @@ class RelayController:
     def _on_assistant_transcript(self, norm: NormalizedEvent) -> StepResult:
         if norm.final:
             self.assistant_parts.clear()
-            line = self._commit("assistant", norm.text)
+            utterance_id = norm.item_id or self._assistant_utterance_id
+            line = self._commit("assistant", norm.text, utterance_id=utterance_id)
             return StepResult(transcripts=[line] if line else [])
         if norm.text:
             self.assistant_parts.append(norm.text)
@@ -297,6 +306,7 @@ class RelayController:
 
     def _on_response_created(self) -> StepResult:
         lines = self._flush_user_partials() + self._flush_assistant()
+        self._assistant_utterance_id = self._next_partial_id()
         self.interrupted = False
         self.response_first_audio_at = None
         self.audio_bytes = 0
@@ -415,13 +425,23 @@ class RelayController:
         ends = self.response_first_audio_at + (self.audio_bytes / _MULAW_RATE)
         return max(0.0, ends - self.clock())
 
+    def _caller_utterance_id(self, item_id: str | None) -> str:
+        """One id per caller utterance, even when interim events omit item_id."""
+        if item_id:
+            self._open_user_id = item_id
+            return item_id
+        if self._open_user_id is None:
+            self._open_user_id = self._next_partial_id()
+        return self._open_user_id
+
     def _flush_user_partials(self) -> list[dict]:
         lines = []
-        for text in self.user_partials.values():
-            line = self._commit("caller", text)
+        for item_id, text in self.user_partials.items():
+            line = self._commit("caller", text, utterance_id=item_id)
             if line:
                 lines.append(line)
         self.user_partials.clear()
+        self._open_user_id = None
         return lines
 
     def _flush_assistant(self) -> list[dict]:
@@ -429,10 +449,12 @@ class RelayController:
             return []
         text = "".join(self.assistant_parts)
         self.assistant_parts.clear()
-        line = self._commit("assistant", text)
+        utterance_id = self._assistant_utterance_id or self._next_partial_id()
+        self._assistant_utterance_id = utterance_id
+        line = self._commit("assistant", text, utterance_id=utterance_id)
         return [line] if line else []
 
-    def _commit(self, role: str, text: str) -> dict | None:
+    def _commit(self, role: str, text: str, utterance_id: str | None = None) -> dict | None:
         cleaned = " ".join((text or "").split())
         if not cleaned:
             return None
@@ -441,17 +463,36 @@ class RelayController:
             line["role"] == "assistant" and line["text"] == opener for line in self.transcript
         ):
             return None
-        if (
-            self.transcript
-            and self.transcript[-1]["role"] == role
-            and self.transcript[-1]["text"] == cleaned
-        ):
-            return None
+        if utterance_id:
+            for line in self.transcript:
+                if line.get("utterance_id") == utterance_id and line["role"] == role:
+                    if line["text"] == cleaned:
+                        return None
+                    line["text"] = cleaned
+                    line["at"] = _iso_now()
+                    return line
+        if self.transcript:
+            last = self.transcript[-1]
+            if last["role"] == role and last["text"] == cleaned:
+                return None
+            # A later final that only extends the previous fragment replaces it.
+            if (
+                last["role"] == role
+                and last.get("utterance_id")
+                and cleaned.startswith(last["text"])
+            ):
+                last["text"] = cleaned
+                last["at"] = _iso_now()
+                if utterance_id:
+                    last["utterance_id"] = utterance_id
+                return last
         line = {
             "role": role,
             "text": cleaned,
             "at": _iso_now(),
         }
+        if utterance_id:
+            line["utterance_id"] = utterance_id
         self.transcript.append(line)
         return line
 

@@ -60,7 +60,10 @@ def test_inbound_prompt_keeps_disclosure_opt_out_and_the_adam_cta():
     assert "Never claim to be human" in text
     assert "record_opt_out" in text
     assert "end_call" in text
-    assert "free 60-minute chat with Adam" in text
+    assert "free 60-minute chat with Adam" not in text
+    assert "Would you be open to a chat with Adam, just to talk it through?" in text
+    assert "Up to an hour, and there's no cost." in text
+    assert "Ask at most twice" in text
     assert "Do not mention prices" in text
     assert "Do not claim client results" in text
     assert "PLACEHOLDER" in text
@@ -89,7 +92,8 @@ def test_unknown_caller_is_answered_without_amd_or_a_twilio_update(client):
     assert "Callback: no" in instructions
     assert "record_opt_out" in instructions
     assert "end_call" in instructions
-    assert "free 60-minute chat with Adam" in instructions
+    assert "Would you be open to a chat with Adam, just to talk it through?" in instructions
+    assert "60-minute" not in instructions
     assert "Do not mention prices" in instructions
     assert UNKNOWN in instructions
     assert "That disclosure is the first turn." in instructions

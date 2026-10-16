@@ -148,6 +148,83 @@ def test_opt_out_is_recorded_and_ends_without_extra_audio():
     assert all(message["type"] != "response.create" for message in done.provider_messages)
 
 
+def test_caller_partials_collapse_to_one_final_utterance():
+    relay = controller()
+    start(relay)
+    fragments = [
+        "Um, keeping",
+        "Um, keeping track of the",
+        "Um, keeping track of to-do lists.",
+    ]
+    for text in fragments:
+        relay.on_provider(
+            {
+                "type": "conversation.item.input_audio_transcription.updated",
+                "transcript": text,
+            }
+        )
+    assert [line["text"] for line in relay.transcript if line["role"] == "caller"] == []
+    relay.on_provider(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": fragments[-1],
+        }
+    )
+    assert [line["text"] for line in relay.transcript if line["role"] == "caller"] == [
+        "Um, keeping track of to-do lists."
+    ]
+
+    relay.on_provider({"type": "input_audio_buffer.speech_started"})
+    relay.on_provider(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "Yes, Tuesday works.",
+            "item_id": "next",
+        }
+    )
+    assert [line["text"] for line in relay.transcript if line["role"] == "caller"] == [
+        "Um, keeping track of to-do lists.",
+        "Yes, Tuesday works.",
+    ]
+
+
+def test_growing_completed_events_replace_the_caller_line_in_place():
+    relay = controller()
+    start(relay)
+    for text in ["Um, keeping", "Um, keeping track of the", "Um, keeping track of to-do lists."]:
+        relay.on_provider(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": text,
+                "item_id": "u1",
+            }
+        )
+    assert [line["text"] for line in relay.transcript if line["role"] == "caller"] == [
+        "Um, keeping track of to-do lists."
+    ]
+
+
+def test_assistant_deltas_are_stored_once():
+    relay = controller()
+    start(relay)
+    relay.on_provider({"type": "response.created"})
+    relay.on_provider({"type": "response.output_audio_transcript.delta", "delta": "That's "})
+    relay.on_provider(
+        {"type": "response.output_audio_transcript.delta", "delta": "a common one."}
+    )
+    assert [line["text"] for line in relay.transcript] == ["Hi, this is an AI assistant."]
+    relay.on_provider(
+        {
+            "type": "response.output_audio_transcript.done",
+            "transcript": "That's a common one.",
+        }
+    )
+    assert [line["text"] for line in relay.transcript if line["role"] == "assistant"] == [
+        "Hi, this is an AI assistant.",
+        "That's a common one.",
+    ]
+
+
 def test_transcripts_record_both_sides_without_duplicating_the_opener():
     relay = controller()
     start(relay)
@@ -385,3 +462,41 @@ async def test_session_is_sent_before_stream_start_and_early_audio_is_kept():
         if not task.done():
             await twilio.inject({"event": "stop"})
             await asyncio.wait_for(task, 2)
+
+
+async def test_stored_transcript_keeps_one_final_caller_line(tmp_path):
+    from app.db import Database
+    from tests.conftest import make_settings
+
+    db = Database(make_settings(tmp_path))
+    await db.connect()
+    try:
+        await db.create_call(
+            {
+                "id": "c1",
+                "stream_token": "tok",
+                "to_number": "+61280001111",
+                "status": "in-progress",
+            }
+        )
+        await db.append_transcript(
+            "c1",
+            [
+                {"role": "caller", "text": "Um, keeping", "utterance_id": "u1"},
+                {"role": "caller", "text": "Um, keeping track of the", "utterance_id": "u1"},
+                {
+                    "role": "caller",
+                    "text": "Um, keeping track of to-do lists.",
+                    "utterance_id": "u1",
+                },
+                {"role": "assistant", "text": "That's a common one.", "utterance_id": "a1"},
+            ],
+        )
+        stored = await db.get("c1")
+        assert [line["text"] for line in stored["transcript"]] == [
+            "Um, keeping track of to-do lists.",
+            "That's a common one.",
+        ]
+        assert all("utterance_id" not in line for line in stored["transcript"])
+    finally:
+        await db.dispose()
