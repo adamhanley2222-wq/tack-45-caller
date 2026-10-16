@@ -13,6 +13,7 @@ from app import __version__
 from app.api import APIError, router
 from app.config import Settings
 from app.db import Database
+from app.prewarm import PrewarmPool
 from app.realtime_ws import default_provider_factory
 from app.twilio_gateway import TwilioGateway
 
@@ -35,9 +36,11 @@ def create_app(
         app.state.http = client
         app.state.gateway = TwilioGateway(settings, client)
         app.state.provider_factory = provider_factory or default_provider_factory
+        app.state.prewarm = PrewarmPool()
         try:
             yield
         finally:
+            await app.state.prewarm.aclose()
             await client.aclose()
             await database.dispose()
 

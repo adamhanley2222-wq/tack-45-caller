@@ -43,6 +43,14 @@ def start(relay: RelayController):
     )
 
 
+def test_start_does_not_send_the_session_twice():
+    relay = controller()
+    relay.setup_sent = True
+    started = start(relay)
+    assert started.provider_messages == []
+    assert started.transcripts[0]["text"] == "Hi, this is an AI assistant."
+
+
 def test_passthrough_forwards_mulaw_unchanged_both_ways():
     relay = controller()
     started = start(relay)
@@ -323,3 +331,57 @@ async def test_runner_forwards_audio_and_hangs_up_after_the_mark():
     assert store.finished["end_reason"].startswith("end_call:")
     assert store.in_progress is True
     assert any(line["role"] == "assistant" for line in store.transcripts)
+
+
+@pytest.mark.asyncio
+async def test_session_is_sent_before_stream_start_and_early_audio_is_kept():
+    plan = SessionPlan(
+        setup_messages=[
+            {"type": "session.update", "session": {"marker": True}},
+            {"type": "conversation.item.create", "item": {"type": "force_message"}},
+        ],
+        provider="grok",
+    )
+    relay = RelayController(
+        call_id="call-1",
+        call_sid="CA1",
+        phone="+61400000000",
+        opener="Hi, is this Sam?",
+        plan=plan,
+        clock=Clock(),
+    )
+    twilio = MemoryTwilio()
+    provider = MemoryProvider()
+    store = MemoryStore()
+    gateway = MemoryGateway()
+    task = asyncio.create_task(
+        run_relay(
+            twilio_ws=twilio,
+            provider=provider,
+            controller=relay,
+            store=store,
+            gateway=gateway,
+        )
+    )
+    try:
+        await _wait_until(lambda: [item.get("type") for item in provider.sent] == [
+            "session.update",
+            "conversation.item.create",
+        ])
+        assert relay.started is False
+        await provider.push({"type": "response.output_audio.delta", "delta": "AAAA"})
+        await twilio.inject(
+            {
+                "event": "start",
+                "streamSid": "MZ1",
+                "start": {"streamSid": "MZ1", "callSid": "CA1"},
+            }
+        )
+        media = await asyncio.wait_for(twilio.outbound.get(), 1)
+        assert media["event"] == "media"
+        assert media["media"]["payload"] == "AAAA"
+        assert relay.transcript[0]["text"] == "Hi, is this Sam?"
+    finally:
+        if not task.done():
+            await twilio.inject({"event": "stop"})
+            await asyncio.wait_for(task, 2)

@@ -1,7 +1,7 @@
 import json
 
 from app.config import Settings
-from app.prompts import render_instructions
+from app.prompts import NO_NAME_OPENER, first_name_from, render_instructions, render_opener
 from app.providers import build_session_plan, normalize_event, realtime_ws_url
 
 
@@ -94,23 +94,79 @@ def test_prompt_mentions_accent_opt_out_and_placeholder():
 
     root = Path(__file__).resolve().parents[1]
     system = (root / "prompts" / "system.txt").read_text(encoding="utf-8")
-    opener = (root / "prompts" / "compliance_opener.txt").read_text(encoding="utf-8")
+    opener = (root / "prompts" / "compliance_opener.txt").read_text(encoding="utf-8").strip()
+    assert opener == "Hi, is this {first_name}?"
     assert "PLACEHOLDER" in system
-    assert "Australian accent" in system
+    assert "male Australian voice" in system
+    assert "ABC-newsreader-style General Australian accent" in system
     assert "record_opt_out" in system
     assert "end_call" in system
-    assert "AI assistant" in opener
-    assert "Adam Hanley" in opener
-    assert "Tack45" in opener
+    assert "I'm an AI assistant calling for Tack45, a Sydney-based AI consultancy" in system
+    assert "free 60-minute chat with Adam" in system
+    assert "Do not mention prices" in system
+    assert "Do not claim client results" in system
+    assert "removed from the call list" in system
+    assert "Never claim to be human" in system
+    assert "compliance opener has already been spoken" not in system
+    assert "AI assistant" not in opener
+    assert "Tack45" not in opener
+    spoken = render_opener(opener, "Sam Lee")
     rendered = render_instructions(
         system,
-        opener=opener,
-        name="Sam",
+        opener=spoken,
+        name="Sam Lee",
         business="Harbour {notes}",
         notes="left a message",
         number="+61200000000",
+        first_name=first_name_from("Sam Lee"),
     )
     assert "Harbour {notes}" in rendered
     assert "left a message" in rendered
     assert "{opener}" not in rendered
-    assert "Sam" in rendered
+    assert "{named_thanks}" not in rendered
+    assert "Hi, is this Sam?" in rendered
+    assert (
+        "Thanks Sam. I'm an AI assistant calling for Tack45, a Sydney-based AI consultancy. "
+        "Would a short chat about practical AI for your business be useful?"
+    ) in rendered
+    assert "Thanks unknown" not in rendered
+
+
+def test_prepare_script_speaks_the_owner_check_when_there_is_no_name(tmp_path):
+    from app.api import prepare_script
+    from tests.conftest import make_settings
+
+    settings = make_settings(tmp_path)
+    opener, plan = prepare_script(
+        settings,
+        {"name": "", "business": "Northside", "notes": "", "to_number": "+61280001111"},
+    )
+    assert opener == "Hi, is that the business owner?"
+    assert plan.setup_messages[1]["item"]["content"][0]["text"] == opener
+    instructions = plan.setup_messages[0]["session"]["instructions"]
+    assert "Thanks. I'm an AI assistant calling for Tack45, a Sydney-based AI consultancy" in instructions
+    assert "Thanks unknown" not in instructions
+    assert "Do not pitch" in instructions
+
+
+def test_opener_uses_the_first_name_or_asks_for_the_owner():
+    template = "Hi, is this {first_name}?"
+    assert first_name_from("Sam Lee") == "Sam"
+    assert first_name_from("  Mary-Jane Watson ") == "Mary-Jane"
+    assert first_name_from("") == ""
+    assert first_name_from("...") == ""
+    assert render_opener(template, "Sam Lee") == "Hi, is this Sam?"
+    assert render_opener(template, "") == NO_NAME_OPENER
+    assert render_opener(template, "   ") == "Hi, is that the business owner?"
+    unnamed = render_instructions(
+        "Say {named_thanks} First name: {first_name}. {opener}",
+        opener=render_opener(template, ""),
+        name="",
+        business="",
+        notes="",
+        number="+611",
+        first_name="",
+    )
+    assert "Thanks. " in unnamed or unnamed.startswith("Say Thanks.")
+    assert "Thanks unknown" not in unnamed
+    assert "Hi, is that the business owner?" in unnamed

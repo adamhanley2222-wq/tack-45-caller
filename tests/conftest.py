@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -63,9 +64,45 @@ def twilio_capture():
     return seen
 
 
+class RecordingProvider:
+    """In-memory realtime socket. Tests must not open a billed provider session."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+        self.connected = False
+        self.closed = False
+        self.inbound: asyncio.Queue = asyncio.Queue()
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def send(self, payload: dict) -> None:
+        self.sent.append(payload)
+
+    async def recv(self):
+        return await self.inbound.get()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def recording_factory(bucket: list):
+    def factory(_settings, _call):
+        provider = RecordingProvider()
+        bucket.append(provider)
+        return provider
+
+    return factory
+
+
 @pytest.fixture
 def client(tmp_path, twilio_capture):
     settings = make_settings(tmp_path)
-    application = create_app(settings, http_transport=twilio_capture["transport"])
+    twilio_capture["providers"] = []
+    application = create_app(
+        settings,
+        http_transport=twilio_capture["transport"],
+        provider_factory=recording_factory(twilio_capture["providers"]),
+    )
     with TestClient(application) as test_client:
         yield test_client, twilio_capture, settings

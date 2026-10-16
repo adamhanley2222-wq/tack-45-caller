@@ -2,17 +2,17 @@
 
 Outbound AI voice calls for Tack45, a Sydney AI consultancy. The service dials an Australian business on a Twilio number, waits for async answering-machine detection, and on a human answer bridges the call to a realtime speech-to-speech model. Audio stays 8 kHz G.711 μ-law from Twilio to the model and back. Nothing is resampled or transcoded.
 
-The sales script is a placeholder. Compliance behaviour is already in place: a fixed opener, an Australian accent instruction, calling-hours and do-not-call guards, and an opt-out tool.
+The sales script is a placeholder. Compliance behaviour is already in place: a short identity check, then an AI disclosure and Tack45 identification before any pitch, an Australian accent instruction, calling-hours and do-not-call guards, and an opt-out tool.
 
 No live Twilio or model calls are made by the tests. `scripts/place_call.py` is the only way to dial, and it does nothing until you point it at a running service that has credentials.
 
 ## Call flow
 
-1. `POST /calls` checks the bearer token, the do-not-call list, and the callee's local calling window, then creates a Twilio call.
+1. `POST /calls` checks the bearer token, the do-not-call list, and the callee's local calling window, then creates a Twilio call. The realtime provider is not contacted while the phone is ringing.
 2. Twilio dials `TWILIO_FROM_NUMBER` (intended to be `+61290904464`) with `MachineDetection=DetectMessageEnd` and async AMD.
-3. While detection runs, the answer webhook returns `<Pause>`.
-4. Human: the call is updated to `<Connect><Stream>` and the media WebSocket opens.
-5. Machine: hang up, or play `MACHINE_MESSAGE` and then hang up. Fax and unknown: hang up. Each result is stored.
+3. On answer, the voice webhook returns `<Connect><Stream>` immediately. It does not pause for AMD. The realtime session is opened at that moment, the session config is sent straight away, and the short opener is spoken without waiting for `AnsweredBy`.
+4. Human, or AMD still pending: the media WebSocket is already up. A later human result is stored and the stream is left as it is.
+5. Machine: hang up, or play `MACHINE_MESSAGE` and then hang up. No voicemail is left unless `MACHINE_MESSAGE` is set. Fax and unknown: hang up. Each result is stored.
 6. The relay forwards μ-law payloads unchanged. Barge-in sends Twilio `clear` and drops audio still queued here. `end_call` hangs up via the Twilio REST API after the current audio finishes.
 
 ```
@@ -83,9 +83,11 @@ Area codes `02`, `03`, and `07` select Sydney, Melbourne, and Brisbane. Mobiles 
 
 `VOICE_PROVIDER=grok` (default) or `openai`.
 
-Both sessions request `audio/pcmu` in and out, `server_vad`, and the tools `end_call` and `record_opt_out`. Grok also enables `grok-transcribe` on input and, unless `USE_FORCE_MESSAGE=false`, speaks the compliance opener with xAI `force_message` (verbatim TTS, not a model-written line). OpenAI has no `force_message`; the opener is requested with `response.create` instructions. See the [xAI voice agent guide](https://docs.x.ai/docs/guides/voice/agent) and the [phone cookbook](https://docs.x.ai/cookbook/examples/voice-agent-phone).
+Both sessions request `audio/pcmu` in and out, `server_vad`, and the tools `end_call` and `record_opt_out`. Grok also enables `grok-transcribe` on input and, unless `USE_FORCE_MESSAGE=false`, speaks the opener with xAI `force_message` (verbatim TTS, not a model-written line). OpenAI has no `force_message`; the opener is requested with `response.create` instructions. See the [xAI voice agent guide](https://docs.x.ai/docs/guides/voice/agent) and the [phone cookbook](https://docs.x.ai/cookbook/examples/voice-agent-phone).
 
-The system prompt is `prompts/system.txt`. The opener is `prompts/compliance_opener.txt`. Replace the placeholder sales section when the real script is ready, and keep the accent, opt-out, and `end_call` rules.
+The opener in `prompts/compliance_opener.txt` is only `Hi, is this {first name}?`. The first name is the first word of the call's `name`. With no name it is `Hi, is that the business owner?`. The model waits. On a confirmation, the next turn must be the AI disclosure and the Tack45 identification before any pitch. A wrong person gets that identification and a request to reach the right person or a callback time, and no pitch. A no to the chat asks about removing the number. Any opt-out, at any time, calls `record_opt_out` and then `end_call`.
+
+The system prompt is `prompts/system.txt`. Replace the placeholder sales section when the real script is ready, and keep the accent, disclosure, opt-out, and `end_call` rules. The accent line asks for a male Australian voice with a calm, clear, ABC-newsreader-style General Australian accent.
 
 Barge-in is suppressed while the opener is still playing, so the disclosure is not cut off. After that, caller speech sends Twilio `{"event":"clear"}` and drops queued μ-law. When the model calls `end_call`, the relay waits until Twilio echoes a mark (playback finished), then `POST`s `Status=completed` on the call. A watchdog hangs up if the mark never returns.
 
@@ -125,7 +127,7 @@ Each call row stores `call_sid`, destination, AMD result, provider, timestamps, 
 | `PROMPT_PATH` | no | Default `prompts/system.txt` |
 | `OPENER_PATH` | no | Default `prompts/compliance_opener.txt` |
 | `MACHINE_MESSAGE` | no | Empty hangs up on machines. Otherwise spoken, then hangup |
-| `AMD_HOLD_SECONDS` | no | Pause while AMD runs. Default 60, and at least detection timeout + 15 |
+| `AMD_HOLD_SECONDS` | no | Unused. The greeting is not held for AMD. Default 60 |
 | `MACHINE_DETECTION_TIMEOUT` | no | Twilio `MachineDetectionTimeout`. Default 30 |
 | `HANGUP_GRACE_SECONDS` | no | Extra wait after playback before the hangup watchdog. Default 8 |
 | `LOG_LEVEL` | no | Default `INFO` |
@@ -141,10 +143,10 @@ Outbound calls set their own webhooks. You do not need a "call comes in" URL on 
 3. Voice geographic permissions must allow calls to Australia.
 4. Deploy so `PUBLIC_BASE_URL` is the public `https` origin (no trailing path).
 5. The service then calls:
-   - `POST {PUBLIC_BASE_URL}/twilio/voice` when the call is answered
-   - `POST {PUBLIC_BASE_URL}/twilio/amd` with `AnsweredBy`
+   - `POST {PUBLIC_BASE_URL}/twilio/voice` when the call is answered. The response connects the media stream at once
+   - `POST {PUBLIC_BASE_URL}/twilio/amd` with `AnsweredBy`. A later machine, fax, or unknown result hangs up
    - `POST {PUBLIC_BASE_URL}/twilio/status` for `initiated`, `ringing`, `answered`, `completed`
-   - `wss://{host}/streams/media?token=...` for media, only after a human answer
+   - `wss://{host}/streams/media/{token}` for media, starting on answer rather than after AMD
 
 Set `TWILIO_AUTH_TOKEN` (the account auth token, not the API key) if you want webhook signatures checked. Leave it unset in local development.
 

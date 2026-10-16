@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from uuid import uuid4
@@ -13,15 +14,14 @@ from app.config import Settings, missing_dial_configuration
 from app.db import public_call
 from app import guards
 from app.phones import PhoneError, infer_timezone, normalize_phone, validate_timezone
-from app.prompts import load_text, render_instructions
-from app.providers import build_session_plan
+from app.prompts import first_name_from, load_text, render_instructions, render_opener
+from app.providers import SessionPlan, build_session_plan
 from app.realtime_ws import default_provider_factory
 from app.relay import RelayController, run_relay
 from app.signatures import signature_is_valid
 from app.twiml import (
     connect_stream_twiml,
     hangup_twiml,
-    hold_twiml,
     say_and_hangup_twiml,
     stream_parameters,
 )
@@ -73,8 +73,29 @@ def stream_url(settings: Settings, token: str) -> str:
     return f"{ws_base(settings)}/streams/media/{token}"
 
 
-def hold_seconds(settings: Settings) -> int:
-    return max(int(settings.amd_hold_seconds), int(settings.machine_detection_timeout) + 15)
+_LIVE = {"streaming", "in-progress"}
+
+
+def prepare_script(settings: Settings, call: dict) -> tuple[str, SessionPlan]:
+    """Render the short opener and the session that speaks it."""
+    opener = render_opener(load_text(settings.opener_path), call.get("name") or "")
+    template = load_text(settings.prompt_path)
+    instructions = render_instructions(
+        template,
+        opener=opener,
+        name=call.get("name") or "",
+        business=call.get("business") or "",
+        notes=call.get("notes") or "",
+        number=call.get("to_number") or "",
+        first_name=first_name_from(call.get("name") or ""),
+    )
+    return opener, build_session_plan(settings, instructions, opener)
+
+
+def _stream_is_live(call: dict) -> bool:
+    if call.get("status") in _LIVE:
+        return True
+    return False
 
 
 def external_url(request: Request, settings: Settings) -> str:
@@ -264,14 +285,22 @@ async def twilio_voice(request: Request) -> Response:
         return xml(hangup_twiml())
     answered = form.get("AnsweredBy")
     decision = decide_amd(answered)
-    if decision == "hold":
-        await request.app.state.db.record_amd(
-            call["id"],
-            amd_result=None,
-            end_reason=None,
-            status="detecting",
-        )
-        return xml(hold_twiml(hold_seconds(settings)))
+    # Speak as soon as the call is answered. Async AMD has no AnsweredBy yet;
+    # a later machine, fax, or unknown result hangs up. Do not open a provider
+    # session before this webhook: that would bill while the phone is ringing.
+    if decision in {"hold", "connect"}:
+        if decision == "connect":
+            await request.app.state.db.record_amd(
+                call["id"],
+                amd_result="human",
+                end_reason=None,
+                status=None,
+            )
+        if _stream_is_live(call):
+            return xml(_connect_twiml(settings, call))
+        twiml = await _arm_stream(request, call)
+        return xml(twiml)
+    await request.app.state.prewarm.discard(call["id"])
     twiml = await _apply_answered_by(request, call, answered or "", respond_with_twiml=True)
     return xml(twiml or hangup_twiml())
 
@@ -322,22 +351,17 @@ async def media_stream(websocket: WebSocket, token: str) -> None:
         await websocket.close(code=1008)
         return
     settings: Settings = websocket.app.state.settings
+    if _call_finished(call):
+        await websocket.app.state.prewarm.discard(call["id"])
+        await websocket.close(code=1000)
+        return
     try:
-        opener = load_text(settings.opener_path)
-        template = load_text(settings.prompt_path)
+        opener, plan = prepare_script(settings, call)
     except FileNotFoundError:
         logger.exception("Prompt file missing.")
         await websocket.close(code=1011)
         return
-    instructions = render_instructions(
-        template,
-        opener=opener,
-        name=call["name"],
-        business=call["business"],
-        notes=call["notes"],
-        number=call["to_number"],
-    )
-    plan = build_session_plan(settings, instructions, opener)
+    provider, setup_sent = await _take_provider(websocket.app, settings, call, plan)
     controller = RelayController(
         call_id=call["id"],
         call_sid=call["call_sid"],
@@ -345,9 +369,8 @@ async def media_stream(websocket: WebSocket, token: str) -> None:
         opener=opener,
         plan=plan,
         hangup_grace_seconds=settings.hangup_grace_seconds,
+        setup_sent=setup_sent,
     )
-    factory = getattr(websocket.app.state, "provider_factory", default_provider_factory)
-    provider = factory(settings, call)
     try:
         await run_relay(
             twilio_ws=websocket,
@@ -396,15 +419,25 @@ async def _apply_answered_by(
     decision = decide_amd(answered_by)
     db = request.app.state.db
     gateway = request.app.state.gateway
+    fresh = await db.get(call["id"]) or call
     if decision == "connect":
-        await db.record_amd(call["id"], amd_result="human", end_reason=None, status="answered")
-        twiml = connect_stream_twiml(stream_url(settings, call["stream_token"]), stream_parameters(call))
+        live = _stream_is_live(fresh)
+        await db.record_amd(
+            call["id"],
+            amd_result="human",
+            end_reason=None,
+            status=None if live else "answered",
+        )
+        if live:
+            return None
+        twiml = await _arm_stream(request, call)
         if respond_with_twiml:
             return twiml
         if call.get("call_sid"):
             await gateway.set_twiml(call["call_sid"], twiml)
         return None
 
+    await request.app.state.prewarm.discard(call["id"])
     reason = amd_end_reason(answered_by)
     if decision == "machine" and settings.machine_message.strip():
         await db.record_amd(
@@ -431,3 +464,59 @@ async def _apply_answered_by(
     if call.get("call_sid"):
         await gateway.hangup(call["call_sid"])
     return None
+
+
+def _connect_twiml(settings: Settings, call: dict) -> str:
+    return connect_stream_twiml(stream_url(settings, call["stream_token"]), stream_parameters(call))
+
+
+def _call_finished(call: dict) -> bool:
+    if call.get("status") in {"completed", "machine", "failed", "refused", "busy", "no-answer", "canceled"}:
+        return True
+    return (call.get("end_reason") or "").startswith("amd_")
+
+
+async def _arm_stream(request: Request, call: dict) -> str:
+    """Connect media now and start the realtime session without waiting for AMD."""
+    settings: Settings = request.app.state.settings
+    await request.app.state.db.mark_streaming(call["id"])
+    await _prewarm_session(request, call)
+    logger.info("Armed media stream for %s before AMD", call["id"])
+    return _connect_twiml(settings, call)
+
+
+async def _prewarm_session(request: Request, call: dict) -> None:
+    """Start the provider handshake. Do not await it: TwiML must return now."""
+    settings: Settings = request.app.state.settings
+    try:
+        _opener, plan = prepare_script(settings, call)
+    except FileNotFoundError:
+        logger.exception("Prompt file missing; the stream will open the session itself.")
+        return
+    try:
+        factory = getattr(request.app.state, "provider_factory", default_provider_factory)
+        provider = factory(settings, call)
+        await request.app.state.prewarm.start(call["id"], provider, plan.setup_messages)
+        # Let the handshake task reach its first await. Do not wait for it.
+        await asyncio.sleep(0)
+    except Exception:
+        logger.exception("Could not schedule a voice session for %s", call["id"])
+
+
+async def _take_provider(app, settings: Settings, call: dict, plan: SessionPlan):
+    """Prefer the session opened at answer. Otherwise connect when the stream starts."""
+    factory = getattr(app.state, "provider_factory", default_provider_factory)
+    entry = await app.state.prewarm.claim(call["id"])
+    if entry is None:
+        return factory(settings, call), False
+    try:
+        await asyncio.wait_for(entry.ready.wait(), timeout=8)
+    except asyncio.TimeoutError:
+        logger.warning("Prewarm timed out for %s; opening a new session.", call["id"])
+        await app.state.prewarm.close_entry(entry)
+        return factory(settings, call), False
+    if entry.setup_sent and entry.error is None and not entry.abandoned:
+        return entry.provider, True
+    logger.warning("Prewarmed session unusable for %s: %s", call["id"], entry.error)
+    await app.state.prewarm.close_entry(entry)
+    return factory(settings, call), False

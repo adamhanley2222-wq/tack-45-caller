@@ -117,6 +117,7 @@ class RelayController:
         plan: SessionPlan,
         hangup_grace_seconds: float = 8.0,
         clock=time.monotonic,
+        setup_sent: bool = False,
     ) -> None:
         self.call_id = call_id
         self.call_sid = call_sid
@@ -125,6 +126,7 @@ class RelayController:
         self.plan = plan
         self.hangup_grace_seconds = hangup_grace_seconds
         self.clock = clock
+        self.setup_sent = setup_sent
 
         self.stream_sid: str | None = None
         self.started = False
@@ -195,7 +197,11 @@ class RelayController:
         self.call_sid = start.get("callSid") or self.call_sid
         self.started = True
         line = self._commit("assistant", self.opener)
-        result = StepResult(provider_messages=list(self.plan.setup_messages))
+        # The session and opener are normally already on the wire. Sending
+        # them again would speak the check twice.
+        messages = [] if self.setup_sent else list(self.plan.setup_messages)
+        self.setup_sent = True
+        result = StepResult(provider_messages=messages)
         if line:
             result.transcripts.append(line)
         return result
@@ -468,10 +474,26 @@ async def run_relay(
     store: CallStore,
     gateway: HangupGateway | None,
 ) -> None:
-    """Bridge one Twilio media stream to one provider socket until the call ends."""
-    await provider.connect()
+    """Bridge one Twilio media stream to one provider socket until the call ends.
+
+    Session configuration and the opener go out as soon as the provider
+    socket is up. They do not wait for Twilio's ``start`` event. Provider
+    audio is held until that event, so frames that arrive during the
+    handshake are forwarded instead of dropped.
+    """
+    if not controller.setup_sent:
+        await provider.connect()
+        for message in controller.plan.setup_messages:
+            await provider.send(message)
+        controller.setup_sent = True
+        logger.info("Sent realtime session for call %s", controller.call_id)
+    else:
+        logger.info("Using prewarmed realtime session for call %s", controller.call_id)
     provider_out: asyncio.Queue = asyncio.Queue()
     twilio_out: asyncio.Queue = asyncio.Queue()
+    stream_ready = asyncio.Event()
+    if controller.started:
+        stream_ready.set()
     finished = False
 
     async def finish(end_reason: str) -> None:
@@ -535,25 +557,26 @@ async def run_relay(
             await twilio_ws.send_json(message)
 
     async def twilio_reader() -> None:
+        marked = False
         while True:
             raw = await twilio_ws.receive_text()
             result = controller.on_twilio(json.loads(raw))
-            if result.provider_messages and not controller.started:
-                pass
-            if controller.started and result.provider_messages and any(
-                item.get("type") == "session.update" for item in result.provider_messages
-            ):
+            if controller.started and not marked:
+                marked = True
                 try:
                     await store.mark_in_progress(controller.call_id)
                 except Exception:
                     logger.exception("Failed to mark the call in progress.")
             await dispatch(result)
+            if controller.started:
+                stream_ready.set()
             if result.stop:
                 if not result.hangup:
                     await finish(result.end_reason or controller.end_reason)
                 return
 
     async def provider_reader() -> None:
+        await stream_ready.wait()
         while True:
             event = await provider.recv()
             if event is None:

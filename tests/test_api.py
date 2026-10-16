@@ -1,6 +1,9 @@
+import asyncio
 import base64
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
+
+import pytest
 
 from app.signatures import compute_twilio_signature
 
@@ -100,7 +103,7 @@ def test_refuses_sunday_and_do_not_call(client, monkeypatch, tmp_path):
     assert seen["requests"] == []
 
 
-def test_voice_hold_then_async_amd_branches(client, monkeypatch):
+def test_answer_connects_immediately_and_prewarms_before_amd(client, monkeypatch):
     monkeypatch.setattr("app.guards.utcnow", _allowed_time)
     http, seen, _settings = client
     created = http.post(
@@ -109,30 +112,46 @@ def test_voice_hold_then_async_amd_branches(client, monkeypatch):
         headers=_auth(),
     ).json()
     call_id = created["id"]
+    assert seen["providers"] == []
 
     voice = http.post(
         f"/twilio/voice?call_id={call_id}",
         data={"CallSid": created["call_sid"]},
     )
     assert voice.status_code == 200
-    assert "<Pause" in voice.text
+    assert "<Pause" not in voice.text
+    assert "<Connect>" in voice.text
+    assert "<Stream" in voice.text
+    assert "wss://caller.example.com/streams/media/" in voice.text
+    assert "Quay Books" in voice.text
+    assert 'track="inbound_track"' in voice.text
     assert voice.headers["content-type"].startswith("text/xml")
+    logged = http.get(f"/calls/{call_id}", headers=_auth()).json()
+    assert logged["status"] == "streaming"
 
+    assert len(seen["providers"]) == 1
+    provider = seen["providers"][0]
+    assert provider.connected is True
+    assert provider.sent[0]["type"] == "session.update"
+    opener = provider.sent[1]
+    assert opener["item"]["type"] == "force_message"
+    assert opener["item"]["content"][0]["text"] == "Hi, is this Pat?"
+    instructions = provider.sent[0]["session"]["instructions"]
+    assert "Thanks Pat. I'm an AI assistant calling for Tack45" in instructions
+    assert "has already been spoken" not in instructions
+
+    before = len(seen["requests"])
     human = http.post(
         f"/twilio/amd?call_id={call_id}",
         data={"CallSid": created["call_sid"], "AnsweredBy": "human"},
     )
     assert human.status_code == 204
-    update = _body(seen["requests"][-1])
-    twiml = update["Twiml"][0]
-    assert "<Connect>" in twiml
-    assert "<Stream" in twiml
-    assert "wss://caller.example.com/streams/media/" in twiml
-    assert "Quay Books" in twiml
-    assert 'track="inbound_track"' in twiml
+    assert len(seen["requests"]) == before
+    assert provider.closed is False
 
     logged = http.get(f"/calls/{call_id}", headers=_auth()).json()
     assert logged["amd_result"] == "human"
+    assert logged["status"] == "streaming"
 
     fax = http.post(
         "/calls",
@@ -152,17 +171,80 @@ def test_voice_hold_then_async_amd_branches(client, monkeypatch):
     assert logged_fax["end_reason"] == "amd_fax"
 
 
+def test_machine_after_answer_hangs_up_without_a_new_session(client, monkeypatch):
+    monkeypatch.setattr("app.guards.utcnow", _allowed_time)
+    http, seen, _settings = client
+    created = http.post(
+        "/calls",
+        json={"to": "+61280008888", "name": "Sam Lee"},
+        headers=_auth(),
+    ).json()
+    voice = http.post(
+        f"/twilio/voice?call_id={created['id']}",
+        data={"CallSid": created["call_sid"]},
+    )
+    assert "<Connect>" in voice.text
+    assert len(seen["providers"]) == 1
+    http.post(
+        f"/twilio/amd?call_id={created['id']}",
+        data={"CallSid": created["call_sid"], "AnsweredBy": "machine_end_beep"},
+    )
+    hangup = _body(seen["requests"][-1])
+    assert hangup["Status"] == ["completed"]
+    assert "Twiml" not in hangup
+    logged = http.get(f"/calls/{created['id']}", headers=_auth()).json()
+    assert logged["amd_result"] == "machine_end_beep"
+    assert logged["end_reason"] == "amd_machine"
+    assert seen["providers"][0].closed is True
+    assert len(seen["providers"]) == 1
+
+
+def test_late_answered_status_does_not_restart_the_stream(client, monkeypatch):
+    monkeypatch.setattr("app.guards.utcnow", _allowed_time)
+    http, seen, _settings = client
+    created = http.post("/calls", json={"to": "+61280009999", "name": "Jo"}, headers=_auth()).json()
+    http.post(
+        f"/twilio/voice?call_id={created['id']}",
+        data={"CallSid": created["call_sid"]},
+    )
+    http.post(
+        "/twilio/status",
+        data={"CallSid": created["call_sid"], "CallStatus": "answered"},
+    )
+    http.post(
+        "/twilio/status",
+        data={"CallSid": created["call_sid"], "CallStatus": "ringing"},
+    )
+    logged = http.get(f"/calls/{created['id']}", headers=_auth()).json()
+    assert logged["status"] == "streaming"
+    before = len(seen["requests"])
+    http.post(
+        f"/twilio/amd?call_id={created['id']}",
+        data={"CallSid": created["call_sid"], "AnsweredBy": "human"},
+    )
+    assert len(seen["requests"]) == before
+
+
 def test_machine_message_and_unknown(monkeypatch, tmp_path, twilio_capture):
     from app.main import create_app
-    from tests.conftest import make_settings
+    from tests.conftest import make_settings, recording_factory
 
     monkeypatch.setattr("app.guards.utcnow", _allowed_time)
     settings = make_settings(tmp_path, machine_message="Sorry we missed you.")
-    application = create_app(settings, http_transport=twilio_capture["transport"])
+    application = create_app(
+        settings,
+        http_transport=twilio_capture["transport"],
+        provider_factory=recording_factory([]),
+    )
     from fastapi.testclient import TestClient
 
     with TestClient(application) as http:
         created = http.post("/calls", json={"to": "+61280003333"}, headers=_auth()).json()
+        voice = http.post(
+            f"/twilio/voice?call_id={created['id']}",
+            data={"CallSid": created["call_sid"]},
+        )
+        assert "<Connect>" in voice.text
         http.post(
             f"/twilio/amd?call_id={created['id']}",
             data={"CallSid": created["call_sid"], "AnsweredBy": "machine_end_silence"},
@@ -214,11 +296,15 @@ def test_twilio_signature_is_enforced_when_configured(monkeypatch, tmp_path, twi
     from fastapi.testclient import TestClient
 
     from app.main import create_app
-    from tests.conftest import make_settings
+    from tests.conftest import make_settings, recording_factory
 
     monkeypatch.setattr("app.guards.utcnow", _allowed_time)
     settings = make_settings(tmp_path, twilio_auth_token="auth-token")
-    application = create_app(settings, http_transport=twilio_capture["transport"])
+    application = create_app(
+        settings,
+        http_transport=twilio_capture["transport"],
+        provider_factory=recording_factory([]),
+    )
     with TestClient(application) as http:
         created = http.post("/calls", json={"to": "+61280007777"}, headers=_auth()).json()
         url = f"https://caller.example.com/twilio/voice?call_id={created['id']}"
@@ -249,6 +335,80 @@ def _expect_socket_closed(http):
 def test_bad_stream_token_closes(client):
     http, _seen, _settings = client
     _expect_socket_closed(http)
+
+
+@pytest.mark.asyncio
+async def test_amd_reason_survives_the_relay_finishing(tmp_path):
+    from app.db import Database
+    from tests.conftest import make_settings
+
+    db = Database(make_settings(tmp_path))
+    await db.connect()
+    try:
+        await db.create_call(
+            {
+                "id": "c1",
+                "stream_token": "tok",
+                "to_number": "+61280001111",
+                "from_number": "+61290904464",
+                "name": "Pat",
+                "business": "",
+                "notes": "",
+                "timezone": "Australia/Sydney",
+                "provider": "grok",
+                "status": "initiated",
+            }
+        )
+        await db.attach_sid("c1", "CA1", "initiated")
+        await db.mark_streaming("c1")
+        await db.apply_twilio_status("CA1", "ringing", None)
+        await db.apply_twilio_status("CA1", "answered", None)
+        row = await db.get("c1")
+        assert row["status"] == "streaming"
+        assert row["answered_at"]
+        await db.record_amd(
+            "c1",
+            amd_result="machine_end_silence",
+            end_reason="amd_machine",
+            status="machine",
+        )
+        await db.mark_in_progress("c1")
+        await db.finish_call(
+            "c1",
+            end_reason="caller_hangup",
+            transcript=[{"role": "assistant", "text": "Hi, is this Pat?"}],
+            status="completed",
+        )
+        row = await db.get("c1")
+        assert row["status"] == "machine"
+        assert row["end_reason"] == "amd_machine"
+        assert row["transcript"][0]["text"] == "Hi, is this Pat?"
+
+        await db.create_call(
+            {
+                "id": "c2",
+                "stream_token": "tok-2",
+                "to_number": "+61280002222",
+                "from_number": "+61290904464",
+                "name": "Sam",
+                "business": "",
+                "notes": "",
+                "timezone": "Australia/Sydney",
+                "provider": "grok",
+                "status": "streaming",
+            }
+        )
+        await asyncio.gather(
+            db.mark_in_progress("c2"),
+            db.record_amd("c2", amd_result="human", end_reason=None, status=None),
+            db.append_transcript("c2", [{"role": "assistant", "text": "Hi, is this Sam?"}]),
+        )
+        live = await db.get("c2")
+        assert live["amd_result"] == "human"
+        assert live["status"] == "in-progress"
+        assert live["transcript"][0]["text"] == "Hi, is this Sam?"
+    finally:
+        await db.dispose()
 
 
 def test_no_transcode_imports():

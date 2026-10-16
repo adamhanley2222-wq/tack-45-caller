@@ -1,1 +1,1 @@
-Hi, this is an AI assistant calling on behalf of Adam Hanley from Tack45, a Sydney AI consultancy. I'm calling to see if a short conversation about practical AI for your business would be useful. If you'd rather not be called, say so and I'll take this number off our list.
+Hi, is this {first_name}?

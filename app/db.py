@@ -6,14 +6,17 @@ SQLite by default. When ``DATABASE_URL`` is a Postgres URL (including the
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import DateTime, Integer, String, Text, delete, select
 from sqlalchemy.engine import URL, make_url
+from sqlalchemy.pool import NullPool
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     async_sessionmaker,
@@ -25,6 +28,29 @@ from app.config import Settings
 from app.phones import PhoneError, normalize_phone
 
 logger = logging.getLogger("tack45.db")
+
+# Twilio status callbacks can arrive out of order. A late "ringing" or
+# "answered" must not undo a stream that is already up.
+_STATUS_RANK = {
+    "created": 0,
+    "dialing": 1,
+    "initiated": 1,
+    "queued": 1,
+    "ringing": 2,
+    "answered": 3,
+    "detecting": 3,
+    "streaming": 4,
+    "in-progress": 5,
+    "machine": 6,
+    "completed": 7,
+    "busy": 7,
+    "failed": 7,
+    "no-answer": 7,
+    "canceled": 7,
+    "refused": 7,
+}
+_TERMINAL_TWILIO = {"completed", "busy", "failed", "no-answer", "canceled"}
+_TERMINAL_CALL = _TERMINAL_TWILIO | {"machine", "refused"}
 
 
 class Base(DeclarativeBase):
@@ -199,13 +225,29 @@ class Database:
     def __init__(self, settings: Settings) -> None:
         url, connect_args = build_engine_url(settings)
         self.url = url
+        pool_kwargs: dict[str, Any] = {}
+        # The default SQLite pool shares one connection. The relay and the AMD
+        # webhook write at the same time, and that single connection deadlocks.
+        if url.drivername.startswith("sqlite"):
+            connect_args = {**connect_args, "timeout": 30}
+            pool_kwargs["poolclass"] = NullPool
         self.engine: AsyncEngine = create_async_engine(
             url,
             connect_args=connect_args,
             pool_pre_ping=True,
+            **pool_kwargs,
         )
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         self.dnc_path = settings.do_not_call_path
+        # One write at a time. Overlapping read-modify-write commits would
+        # drop an AMD result or a transcript line.
+        self._lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def _begin(self):
+        async with self._lock:
+            async with self.sessions() as session:
+                yield session
 
     async def connect(self) -> None:
         async with self.engine.begin() as conn:
@@ -219,7 +261,7 @@ class Database:
         """Replace file-sourced rows with the current file. Opt-outs are kept."""
         numbers = load_dnc_file(self.dnc_path)
         now = _utcnow()
-        async with self.sessions() as session:
+        async with self._begin() as session:
             existing = (
                 await session.execute(
                     select(DoNotCallRow).where(DoNotCallRow.source == "file")
@@ -247,7 +289,7 @@ class Database:
         return len(numbers)
 
     async def blocked_numbers(self) -> set[str]:
-        async with self.sessions() as session:
+        async with self._begin() as session:
             rows = (await session.execute(select(DoNotCallRow.phone))).scalars().all()
         return set(rows)
 
@@ -276,19 +318,19 @@ class Database:
         )
         if fields.get("status") == "refused":
             row.ended_at = row.ended_at or _utcnow()
-        async with self.sessions() as session:
+        async with self._begin() as session:
             session.add(row)
             await session.commit()
             await session.refresh(row)
             return call_to_dict(row)
 
     async def get(self, call_id: str) -> dict[str, Any] | None:
-        async with self.sessions() as session:
+        async with self._begin() as session:
             row = await session.get(CallRow, call_id)
             return call_to_dict(row) if row else None
 
     async def get_by_sid(self, call_sid: str) -> dict[str, Any] | None:
-        async with self.sessions() as session:
+        async with self._begin() as session:
             row = (
                 await session.execute(select(CallRow).where(CallRow.call_sid == call_sid))
             ).scalar_one_or_none()
@@ -297,7 +339,7 @@ class Database:
     async def get_by_stream_token(self, token: str) -> dict[str, Any] | None:
         if not token:
             return None
-        async with self.sessions() as session:
+        async with self._begin() as session:
             row = (
                 await session.execute(
                     select(CallRow).where(CallRow.stream_token == token)
@@ -307,7 +349,7 @@ class Database:
 
     async def list_calls(self, limit: int = 50) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 200))
-        async with self.sessions() as session:
+        async with self._begin() as session:
             rows = (
                 await session.execute(
                     select(CallRow).order_by(CallRow.created_at.desc()).limit(limit)
@@ -316,7 +358,7 @@ class Database:
             return [call_to_dict(row) for row in rows]
 
     async def attach_sid(self, call_id: str, call_sid: str, status: str) -> None:
-        async with self.sessions() as session:
+        async with self._begin() as session:
             row = await session.get(CallRow, call_id)
             if row is None:
                 return
@@ -325,7 +367,7 @@ class Database:
             await session.commit()
 
     async def mark_failed(self, call_id: str, reason: str) -> None:
-        async with self.sessions() as session:
+        async with self._begin() as session:
             row = await session.get(CallRow, call_id)
             if row is None:
                 return
@@ -342,7 +384,7 @@ class Database:
         end_reason: str | None,
         status: str | None,
     ) -> None:
-        async with self.sessions() as session:
+        async with self._begin() as session:
             row = await session.get(CallRow, call_id)
             if row is None:
                 return
@@ -358,10 +400,24 @@ class Database:
                 row.answered_at = _utcnow()
             await session.commit()
 
-    async def mark_in_progress(self, call_id: str) -> None:
-        async with self.sessions() as session:
+    async def mark_streaming(self, call_id: str) -> None:
+        """The answer webhook has connected the media stream."""
+        async with self._begin() as session:
             row = await session.get(CallRow, call_id)
             if row is None:
+                return
+            if row.status not in _TERMINAL_CALL and _STATUS_RANK.get(row.status, 0) <= _STATUS_RANK["streaming"]:
+                row.status = "streaming"
+            if row.answered_at is None:
+                row.answered_at = _utcnow()
+            await session.commit()
+
+    async def mark_in_progress(self, call_id: str) -> None:
+        async with self._begin() as session:
+            row = await session.get(CallRow, call_id)
+            if row is None:
+                return
+            if row.status in _TERMINAL_CALL or (row.end_reason or "").startswith("amd_"):
                 return
             row.status = "in-progress"
             if row.answered_at is None:
@@ -371,7 +427,7 @@ class Database:
     async def append_transcript(self, call_id: str, lines: list[dict[str, Any]]) -> None:
         if not lines:
             return
-        async with self.sessions() as session:
+        async with self._begin() as session:
             row = await session.get(CallRow, call_id)
             if row is None:
                 return
@@ -394,7 +450,7 @@ class Database:
         from uuid import uuid4
 
         now = _utcnow()
-        async with self.sessions() as session:
+        async with self._begin() as session:
             session.add(
                 OptOutRow(
                     id=str(uuid4()),
@@ -429,10 +485,16 @@ class Database:
         transcript: list[dict[str, Any]],
         status: str = "completed",
     ) -> None:
-        async with self.sessions() as session:
+        async with self._begin() as session:
             row = await session.get(CallRow, call_id)
             if row is None:
                 return
+            if (row.end_reason or "").startswith("amd_") and end_reason in {
+                "caller_hangup",
+                "completed",
+                "relay_error",
+            }:
+                end_reason = row.end_reason
             row.end_reason = end_reason or row.end_reason
             row.transcript_json = json.dumps(transcript)
             row.ended_at = as_utc(row.ended_at) or _utcnow()
@@ -441,6 +503,8 @@ class Database:
                 row.duration_seconds = max(
                     0, int((as_utc(row.ended_at) - answered).total_seconds())
                 )
+            if row.status == "machine" and status == "completed":
+                status = "machine"
             if row.status not in {"busy", "failed", "no-answer", "canceled"}:
                 row.status = status
             await session.commit()
@@ -451,17 +515,22 @@ class Database:
         status: str,
         duration: str | None,
     ) -> bool:
-        async with self.sessions() as session:
+        async with self._begin() as session:
             row = (
                 await session.execute(select(CallRow).where(CallRow.call_sid == call_sid))
             ).scalar_one_or_none()
             if row is None:
                 return False
             now = _utcnow()
-            row.status = status
-            if status in {"answered", "in-progress"} and row.answered_at is None:
+            if status in {"answered", "in-progress", "streaming"} and row.answered_at is None:
                 row.answered_at = now
-            terminal = {"completed", "busy", "failed", "no-answer", "canceled"}
+            if status not in _TERMINAL_TWILIO and _STATUS_RANK.get(status, 0) < _STATUS_RANK.get(
+                row.status, 0
+            ):
+                await session.commit()
+                return True
+            row.status = status
+            terminal = _TERMINAL_TWILIO
             if status in terminal:
                 row.ended_at = as_utc(row.ended_at) or now
                 if not row.end_reason:
@@ -477,6 +546,6 @@ class Database:
             return True
 
     async def delete_file_sourced_for_tests(self) -> None:
-        async with self.sessions() as session:
+        async with self._begin() as session:
             await session.execute(delete(DoNotCallRow).where(DoNotCallRow.source == "file"))
             await session.commit()

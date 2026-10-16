@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     opener_path: str = "prompts/compliance_opener.txt"
     # Empty means hang up on an answering machine. Any text is spoken, then the call ends.
     machine_message: str = ""
+    # No longer delays the greeting. The stream starts on answer; AMD hangs up machines later.
     amd_hold_seconds: int = 60
     machine_detection_timeout: int = 30
     hangup_grace_seconds: float = 8.0
