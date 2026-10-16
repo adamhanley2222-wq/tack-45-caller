@@ -1,0 +1,7 @@
+# Do-not-call numbers, one per line.
+# Local Australian formats and E.164 both work.
+# Lines starting with # are ignored.
+# Opt-outs recorded during a call are stored in the database and do not need to be copied here.
+#
+# Example (fake number, commented out):
+# +61400000000
