@@ -64,6 +64,11 @@ def test_inbound_prompt_keeps_disclosure_opt_out_and_the_adam_cta():
     assert "Would you be open to a chat with Adam, just to talk it through?" in text
     assert "Up to an hour, and there's no cost." in text
     assert "Ask at most twice" in text
+    assert "KNOWLEDGE" in text
+    assert "Northern Beaches" in text
+    assert "Forestville" not in text
+    assert "adam@tack45.com.au" in text
+    assert "AI for Owners" in text
     assert "Do not mention prices" in text
     assert "Do not claim client results" in text
     assert "PLACEHOLDER" in text
