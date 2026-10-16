@@ -70,7 +70,7 @@ def ws_base(settings: Settings) -> str:
 
 
 def stream_url(settings: Settings, token: str) -> str:
-    return f"{ws_base(settings)}/streams/media?token={token}"
+    return f"{ws_base(settings)}/streams/media/{token}"
 
 
 def hold_seconds(settings: Settings) -> int:
@@ -313,9 +313,9 @@ async def twilio_status(request: Request) -> Response:
     return Response(status_code=204)
 
 
-@router.websocket("/streams/media")
-async def media_stream(websocket: WebSocket) -> None:
-    token = websocket.query_params.get("token", "")
+@router.websocket("/streams/media/{token}")
+async def media_stream(websocket: WebSocket, token: str) -> None:
+    # Token travels in the path: Twilio strips query strings from <Stream url>.
     await websocket.accept()
     call = await websocket.app.state.db.get_by_stream_token(token)
     if call is None:

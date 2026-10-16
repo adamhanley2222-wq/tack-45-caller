@@ -54,7 +54,7 @@ def test_create_call_uses_async_amd_and_api_key(client, monkeypatch):
     assert body["provider"] == "grok"
     assert body["timezone"] == "Australia/Sydney"
     assert body["timezone_warning"]
-    assert body["stream_url"].startswith("wss://caller.example.com/streams/media?token=")
+    assert body["stream_url"].startswith("wss://caller.example.com/streams/media/")
 
     request = seen["requests"][0]
     encoded = base64.b64encode(
@@ -127,7 +127,7 @@ def test_voice_hold_then_async_amd_branches(client, monkeypatch):
     twiml = update["Twiml"][0]
     assert "<Connect>" in twiml
     assert "<Stream" in twiml
-    assert "wss://caller.example.com/streams/media?token=" in twiml
+    assert "wss://caller.example.com/streams/media/" in twiml
     assert "Quay Books" in twiml
     assert 'track="inbound_track"' in twiml
 
@@ -239,7 +239,7 @@ def _expect_socket_closed(http):
     from starlette.websockets import WebSocketDisconnect
 
     try:
-        with http.websocket_connect("/streams/media?token=not-a-real-token") as socket:
+        with http.websocket_connect("/streams/media/not-a-real-token") as socket:
             socket.receive_text()
     except WebSocketDisconnect:
         return

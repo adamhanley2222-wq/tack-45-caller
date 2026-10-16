@@ -31,11 +31,11 @@ def test_twiml_documents():
     assert "<Hangup/>" in spoken
 
     stream = connect_stream_twiml(
-        "wss://caller.example.com/streams/media?token=abc",
+        "wss://caller.example.com/streams/media/abc",
         {"call_id": "1", "business": 'Fish & "Chips"'},
     )
     assert 'track="inbound_track"' in stream
-    assert "wss://caller.example.com/streams/media?token=abc" in stream
+    assert "wss://caller.example.com/streams/media/abc" in stream
     assert "Fish &amp;" in stream
     assert "Chips" in stream
     assert "<Connect>" in stream
