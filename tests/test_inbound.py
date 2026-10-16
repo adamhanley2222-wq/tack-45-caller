@@ -13,18 +13,10 @@ from app.signatures import compute_twilio_signature
 from tests.conftest import make_settings, recording_factory
 from tests.test_api import _allowed_time, _auth
 
-KNOWN = (
-    "Hi Sam, thanks for calling back Tack45. I'm an AI assistant. "
-    "We called earlier to see if a short chat about practical AI for your business would be useful."
-)
-UNKNOWN = (
-    "Thanks for calling Tack45, I'm an AI assistant. "
-    "How can I help, or would you like me to take a message?"
-)
-NO_NAME = (
-    "Hi, thanks for calling back Tack45. I'm an AI assistant. "
-    "We called earlier to see if a short chat about practical AI for your business would be useful."
-)
+KNOWN = "Hello, Tack45, is this Sam?"
+UNKNOWN = "Hello, Tack45. Just so you know, I'm an AI assistant. How can I help?"
+NO_NAME = "Hello, Tack45, is that the business owner?"
+CONFIRM = "Thanks for calling back. Just so you know, I'm an AI assistant for Tack45."
 
 
 def _spoken(provider) -> str:
@@ -73,6 +65,9 @@ def test_inbound_prompt_keeps_disclosure_opt_out_and_the_adam_cta():
     assert "Do not claim client results" in text
     assert "PLACEHOLDER" in text
     assert "Do not use the word \"unknown\" aloud" in text
+    assert "Thanks for calling back. Just so you know, I'm an AI assistant for Tack45." in text
+    assert "The AI disclosure must be in the first or second turn." in text
+    assert "Hello, Tack45, is this" not in text
 
 
 def test_unknown_caller_is_answered_without_amd_or_a_twilio_update(client):
@@ -96,7 +91,10 @@ def test_unknown_caller_is_answered_without_amd_or_a_twilio_update(client):
     assert "end_call" in instructions
     assert "free 60-minute chat with Adam" in instructions
     assert "Do not mention prices" in instructions
-    assert "I'm an AI" in instructions
+    assert UNKNOWN in instructions
+    assert "That disclosure is the first turn." in instructions
+    assert "I'm an AI" in UNKNOWN
+    assert "AI" not in KNOWN
 
     listed = http.get("/calls", headers=_auth()).json()
     assert len(listed) == 1
@@ -139,7 +137,10 @@ def test_known_caller_gets_the_callback_opener_and_prior_context(client, monkeyp
     assert len(seen["providers"]) == 1
     provider = seen["providers"][0]
     assert _spoken(provider) == KNOWN
+    assert "AI" not in _spoken(provider)
     instructions = _instructions(provider)
+    assert CONFIRM in instructions
+    assert "second turn" in instructions
     assert "Callback: yes" in instructions
     assert "Harbour Roasters" in instructions
     assert "Asked about invoices" in instructions
@@ -256,8 +257,10 @@ def test_prepare_inbound_script_for_a_known_caller_with_no_first_name(tmp_path):
         {"name": "", "business": "Northside", "notes": "owner was out"},
     )
     assert opener == NO_NAME
+    assert "AI" not in opener
     assert plan.setup_messages[1]["item"]["content"][0]["text"] == opener
     instructions = plan.setup_messages[0]["session"]["instructions"]
+    assert CONFIRM in instructions
     assert "Callback: yes" in instructions
     assert "Northside" in instructions
     assert "owner was out" in instructions
