@@ -96,7 +96,12 @@ def test_prompt_mentions_accent_opt_out_and_placeholder():
     system = (root / "prompts" / "system.txt").read_text(encoding="utf-8")
     opener = (root / "prompts" / "compliance_opener.txt").read_text(encoding="utf-8").strip()
     assert opener == "Hi, is this {first_name}?"
-    assert "PLACEHOLDER" in system
+    assert "PLACEHOLDER" not in system
+    assert "ABOUT ADAM" in system
+    assert "Adam Hanley, who runs Tack45" in system
+    assert "Forestville" in system
+    assert "02 9090 4464" in system
+    assert "Recruit Vector" in system
     assert "male Australian voice" in system
     assert "ABC-newsreader-style General Australian accent" in system
     assert "record_opt_out" in system
