@@ -30,6 +30,7 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         prompt_path=str(ROOT / "prompts" / "system.txt"),
         opener_path=str(ROOT / "prompts" / "compliance_opener.txt"),
         inbound_prompt_path=str(ROOT / "prompts" / "inbound_system.txt"),
+        briefs_dir=str(ROOT / "prompts" / "briefs"),
         machine_message="",
         default_timezone="Australia/Sydney",
     )

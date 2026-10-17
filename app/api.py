@@ -15,6 +15,7 @@ from app.config import Settings, missing_dial_configuration
 from app.db import FINAL_TWILIO_STATUSES, public_call
 from app import guards
 from app.phones import PhoneError, infer_timezone, normalize_phone, validate_timezone
+from app.briefs import BriefError, apply_brief, resolve_brief
 from app.prompts import first_name_from, inbound_opener, load_text, render_instructions, render_opener
 from app.providers import SessionPlan, build_session_plan
 from app.realtime_ws import default_provider_factory
@@ -91,6 +92,9 @@ def prepare_script(settings: Settings, call: dict) -> tuple[str, SessionPlan]:
         number=call.get("to_number") or "",
         first_name=first_name_from(call.get("name") or ""),
     )
+    first = first_name_from(call.get("name") or "")
+    named_thanks = f"Thanks {first}." if first else "Thanks."
+    instructions = apply_brief(instructions, call.get("brief") or "", named_thanks=named_thanks)
     return opener, build_session_plan(settings, instructions, opener)
 
 
@@ -196,6 +200,12 @@ async def create_call(request: Request) -> JSONResponse:
     timezone_field = payload.get("timezone")
     if len(name) > 200 or len(business) > 200 or len(notes) > 2000:
         raise APIError(422, "invalid_body", "name, business, or notes is too long.")
+    try:
+        brief = resolve_brief(settings.briefs_dir, payload.get("brief"), payload.get("brief_id"))
+    except BriefError as exc:
+        if exc.unknown:
+            raise APIError(400, "unknown_brief", exc.message) from exc
+        raise APIError(422, "invalid_body", exc.message) from exc
 
     try:
         number = normalize_phone(raw_to)
@@ -240,6 +250,7 @@ async def create_call(request: Request) -> JSONResponse:
                 "name": name,
                 "business": business,
                 "notes": notes,
+                "brief": brief,
                 "timezone": timezone_name,
                 "provider": provider,
                 "status": "refused",
@@ -268,6 +279,7 @@ async def create_call(request: Request) -> JSONResponse:
             "name": name,
             "business": business,
             "notes": notes,
+            "brief": brief,
             "timezone": timezone_name,
             "provider": provider,
             "status": "dialing",

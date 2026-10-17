@@ -62,7 +62,13 @@ Optional `--timezone Australia/Perth` when the number's area code is ambiguous. 
 {"to": "+61412345678", "name": "Sam Lee", "business": "Harbour Roasters", "notes": ""}
 ```
 
-`timezone` is optional. `GET /calls/{id}` returns the AMD result, timestamps, duration, transcript, opt-out flag, and end reason.
+`timezone` is optional. An optional `brief` string, or a `brief_id` that loads `prompts/briefs/<id>.md`, is appended to the outbound system prompt under `TARGET-SPECIFIC CALL BRIEF`. Where that brief has an opener line 2, it replaces the generic post-confirmation sentence. The spoken opener stays `Hi, is this {first name}?`. Disclosure, opt-out, honesty, and no-claims rules still apply. An unknown `brief_id` returns 400 and does not dial. Send one of `brief` or `brief_id`, not both.
+
+```json
+{"to": "+61412345678", "name": "Marc Hanley", "business": "Barrenjoey Inspections", "notes": "", "brief_id": "barrenjoey-marc"}
+```
+
+`GET /calls/{id}` returns the AMD result, timestamps, duration, transcript, opt-out flag, and end reason.
 
 ## Calling hours and do-not-call
 

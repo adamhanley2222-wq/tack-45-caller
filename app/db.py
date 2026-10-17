@@ -85,6 +85,7 @@ class CallRow(Base):
     name: Mapped[str] = mapped_column(String(200), default="")
     business: Mapped[str] = mapped_column(String(200), default="")
     notes: Mapped[str] = mapped_column(Text, default="")
+    brief: Mapped[str] = mapped_column(Text, default="", server_default=text("''"))
     timezone: Mapped[str] = mapped_column(String(64), default="Australia/Sydney")
     provider: Mapped[str] = mapped_column(String(16), default="")
     status: Mapped[str] = mapped_column(String(32), default="created", index=True)
@@ -180,6 +181,7 @@ def call_to_dict(row: CallRow) -> dict[str, Any]:
         "name": row.name,
         "business": row.business,
         "notes": row.notes,
+        "brief": row.brief or "",
         "timezone": row.timezone,
         "provider": row.provider,
         "status": row.status,
@@ -289,6 +291,7 @@ _ADDED_CALL_COLUMNS = {
     "stream_pending": "INTEGER NOT NULL DEFAULT 0",
     "stream_open": "INTEGER NOT NULL DEFAULT 0",
     "transcript_posted": "INTEGER NOT NULL DEFAULT 0",
+    "brief": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -405,6 +408,7 @@ class Database:
             name=fields.get("name") or "",
             business=fields.get("business") or "",
             notes=fields.get("notes") or "",
+            brief=fields.get("brief") or "",
             timezone=fields.get("timezone") or "Australia/Sydney",
             provider=fields.get("provider") or "",
             status=fields.get("status") or "created",
