@@ -262,10 +262,49 @@ def test_machine_message_and_unknown(monkeypatch, tmp_path, twilio_capture):
             f"/twilio/amd?call_id={other['id']}",
             data={"CallSid": other["call_sid"], "AnsweredBy": "unknown"},
         )
-        assert _body(twilio_capture["requests"][-1])["Status"] == ["completed"]
+        continued = _body(twilio_capture["requests"][-1])
+        assert continued.get("Status") != ["completed"]
+        assert "<Connect>" in continued["Twiml"][0]
         logged_unknown = http.get(f"/calls/{other['id']}", headers=_auth()).json()
         assert logged_unknown["amd_result"] == "unknown"
-        assert logged_unknown["end_reason"] == "amd_unknown"
+        assert logged_unknown["end_reason"] is None
+        assert logged_unknown["status"] != "completed"
+
+
+def test_late_unknown_amd_does_not_hang_up_a_live_call(client, monkeypatch):
+    monkeypatch.setattr("app.guards.utcnow", _allowed_time)
+    http, seen, _settings = client
+    created = http.post(
+        "/calls",
+        json={"to": "+61280001234", "name": "Marc Hanley"},
+        headers=_auth(),
+    ).json()
+    voice = http.post(
+        f"/twilio/voice?call_id={created['id']}",
+        data={"CallSid": created["call_sid"]},
+    )
+    assert "<Connect>" in voice.text
+    assert seen["providers"][0].sent[1]["item"]["content"][0]["text"] == "Hi, is this Marc?"
+    before = len(seen["requests"])
+    late = http.post(
+        f"/twilio/amd?call_id={created['id']}",
+        data={"CallSid": created["call_sid"], "AnsweredBy": "unknown"},
+    )
+    assert late.status_code == 204
+    assert len(seen["requests"]) == before
+    assert seen["providers"][0].closed is False
+    logged = http.get(f"/calls/{created['id']}", headers=_auth()).json()
+    assert logged["status"] == "streaming"
+    assert logged["amd_result"] == "unknown"
+    assert logged["end_reason"] is None
+
+    odd = http.post(
+        f"/twilio/amd?call_id={created['id']}",
+        data={"CallSid": created["call_sid"], "AnsweredBy": "not_a_real_result"},
+    )
+    assert odd.status_code == 204
+    assert len(seen["requests"]) == before
+    assert seen["providers"][0].closed is False
 
 
 def test_sync_amd_on_the_answer_webhook(client, monkeypatch):

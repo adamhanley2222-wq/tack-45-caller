@@ -16,16 +16,18 @@ def decide_amd(answered_by: str | None) -> str:
     """Return ``hold``, ``connect``, ``machine``, or ``hangup``.
 
     An empty result means async detection has not finished, so the answer
-    webhook should keep the line open. ``unknown`` and ``fax`` hang up.
+    webhook should keep the line open. Only ``fax`` hangs up. ``unknown`` and
+    any other unrecognised value continue as a human, including when a late
+    async AMD callback arrives after the media stream has already started.
     """
     value = (answered_by or "").strip().lower()
     if value == "":
         return "hold"
-    if value == "human":
-        return "connect"
+    if value == "fax":
+        return "hangup"
     if value in _MACHINE:
         return "machine"
-    return "hangup"
+    return "connect"
 
 
 def amd_end_reason(answered_by: str | None) -> str:

@@ -69,6 +69,7 @@ def test_inbound_prompt_keeps_disclosure_opt_out_and_the_adam_cta():
     assert "Forestville" not in text
     assert "adam@tack45.com.au" in text
     assert "AI for Owners" in text
+    assert "Ha, I'll leave the cooking to you." in text
     assert "UiPath integration and audits" in text
     assert "Do not mention prices" in text
     assert "Do not claim client results" in text

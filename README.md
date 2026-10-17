@@ -12,7 +12,7 @@ No live Twilio or model calls are made by the tests. `scripts/place_call.py` is 
 2. Twilio dials `TWILIO_FROM_NUMBER` (intended to be `+61290904464`) with `MachineDetection=DetectMessageEnd` and async AMD.
 3. On answer, the voice webhook returns `<Connect><Stream>` immediately. It does not pause for AMD. The realtime session is opened at that moment, the session config is sent straight away, and the short opener is spoken without waiting for `AnsweredBy`.
 4. Human, or AMD still pending: the media WebSocket is already up. A later human result is stored and the stream is left as it is.
-5. Machine: hang up, or play `MACHINE_MESSAGE` and then hang up. No voicemail is left unless `MACHINE_MESSAGE` is set. Fax and unknown: hang up. Each result is stored.
+5. Machine: hang up, or play `MACHINE_MESSAGE` and then hang up. No voicemail is left unless `MACHINE_MESSAGE` is set. Fax hangs up. `unknown` and any other unrecognised result stay on the line. Each result is stored.
 6. The relay forwards μ-law payloads unchanged. Barge-in sends Twilio `clear` and drops audio still queued here. `end_call` hangs up via the Twilio REST API after the current audio finishes.
 
 ```
@@ -167,7 +167,7 @@ Outbound calls set their own answer, AMD, and status webhooks. Inbound calls use
 4. Deploy so `PUBLIC_BASE_URL` is the public `https` origin (no trailing path).
 5. The service then calls:
    - `POST {PUBLIC_BASE_URL}/twilio/voice` when the call is answered. The response connects the media stream at once
-   - `POST {PUBLIC_BASE_URL}/twilio/amd` with `AnsweredBy`. A later machine, fax, or unknown result hangs up
+   - `POST {PUBLIC_BASE_URL}/twilio/amd` with `AnsweredBy`. A later machine or fax result hangs up. `unknown` leaves the live conversation running
    - `POST {PUBLIC_BASE_URL}/twilio/status` for `initiated`, `ringing`, `answered`, `completed`
    - `wss://{host}/streams/media/{token}` for media, starting on answer rather than after AMD
 

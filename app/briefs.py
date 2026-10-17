@@ -8,7 +8,7 @@ from pathlib import Path
 # Spoken after the person confirms the identity check, unless a brief replaces it.
 GENERIC_CONFIRMATION = (
     "{named_thanks} I'm an AI assistant calling for Tack45, a Sydney-based AI consultancy. "
-    "Would a short chat about practical AI for your business be useful?"
+    "Is now a good time for a quick chat?"
 )
 
 BRIEF_HEADING = (

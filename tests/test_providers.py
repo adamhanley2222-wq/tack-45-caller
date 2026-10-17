@@ -148,8 +148,9 @@ def test_prompt_mentions_accent_opt_out_and_placeholder():
     assert "Hi, is this Sam?" in rendered
     assert (
         "Thanks Sam. I'm an AI assistant calling for Tack45, a Sydney-based AI consultancy. "
-        "Would a short chat about practical AI for your business be useful?"
+        "Is now a good time for a quick chat?"
     ) in rendered
+    assert "Ha, I'll leave the cooking to you." in rendered
     assert "Thanks unknown" not in rendered
 
 

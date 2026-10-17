@@ -533,7 +533,7 @@ class Database:
                 row.status = status
             if status in {"completed", "machine"} and row.ended_at is None and status == "completed":
                 row.ended_at = _utcnow()
-            if amd_result == "human" and row.answered_at is None:
+            if row.answered_at is None and (amd_result == "human" or status == "answered"):
                 row.answered_at = _utcnow()
             await session.commit()
 

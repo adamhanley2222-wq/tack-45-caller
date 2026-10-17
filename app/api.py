@@ -344,14 +344,14 @@ async def twilio_voice(request: Request) -> Response:
         return xml(hangup_twiml())
     answered = form.get("AnsweredBy")
     decision = decide_amd(answered)
-    # Speak as soon as the call is answered. Async AMD has no AnsweredBy yet;
-    # a later machine, fax, or unknown result hangs up. Do not open a provider
-    # session before this webhook: that would bill while the phone is ringing.
+    # Speak as soon as the call is answered. Async AMD has no AnsweredBy yet.
+    # A later machine or fax result hangs up. unknown continues. Do not open a
+    # provider session before this webhook: that would bill while the phone is ringing.
     if decision in {"hold", "connect"}:
         if decision == "connect":
             await request.app.state.db.record_amd(
                 call["id"],
-                amd_result="human",
+                amd_result=(answered or "").strip().lower() or "human",
                 end_reason=None,
                 status=None,
             )
@@ -570,10 +570,11 @@ async def _apply_answered_by(
         live = _stream_is_live(fresh)
         await db.record_amd(
             call["id"],
-            amd_result="human",
+            amd_result=(answered_by or "").strip().lower() or "human",
             end_reason=None,
             status=None if live else "answered",
         )
+        # A live stream stays up. unknown must not hang the call up here.
         if live:
             return None
         twiml = await _arm_stream(request, call)

@@ -10,12 +10,12 @@ from tests.test_api import _allowed_time, _auth
 
 GENERIC = (
     "Thanks {name}. I'm an AI assistant calling for Tack45, a Sydney-based AI consultancy. "
-    "Would a short chat about practical AI for your business be useful?"
+    "Is now a good time for a quick chat?"
 )
 MARC_LINE = (
     "Thanks Marc. I'm an AI assistant calling for Tack45, Adam's AI business. "
     "Adam asked me to give you a call so you could hear what one of these sounds like. "
-    "Have you got a couple of minutes?"
+    "Is now a good time for a quick chat?"
 )
 
 
@@ -73,6 +73,8 @@ def test_brief_id_loads_the_file_and_replaces_the_confirmation_line(client, monk
     assert "record_opt_out" in instructions
     assert "Never claim to be human" in instructions
     assert "Barrenjoey Inspections" in instructions
+    assert "Ha, I'll leave the cooking to you." in instructions
+    assert "Have you got a couple of minutes?" not in instructions
 
 
 def test_inline_brief_is_appended(client, monkeypatch):
