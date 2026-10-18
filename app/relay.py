@@ -46,6 +46,14 @@ _GPTLIVE_TURN_GAP_MS = 700
 class CallStore(Protocol):
     async def append_transcript(self, call_id: str, lines: list[dict]) -> None: ...
 
+    async def record_provider_session(
+        self,
+        call_id: str,
+        *,
+        voice: str | None,
+        session_id: str | None,
+    ) -> None: ...
+
     async def record_opt_out(
         self,
         *,
@@ -81,6 +89,9 @@ class StepResult:
     hangup: bool = False
     stop: bool = False
     end_reason: str | None = None
+    capture_provider_session: bool = False
+    provider_voice: str | None = None
+    provider_session_id: str | None = None
 
 
 def drain_queued_audio(queue: asyncio.Queue) -> int:
@@ -196,8 +207,13 @@ class RelayController:
 
     def on_provider(self, event: dict) -> StepResult:
         norm = normalize_event(event)
+        if self.plan.provider == "gptlive" and _gptlive_problem(event):
+            logger.warning(
+                "GPT-Live event: %s",
+                json.dumps(_redact_audio(event), default=str),
+            )
         if norm.kind == "session_started":
-            return self._on_session_started()
+            return self._on_session_started(event)
         if norm.kind == "session_closed":
             return StepResult()
         if norm.kind == "audio":
@@ -217,7 +233,8 @@ class RelayController:
             self._collect_function_calls(event)
             return self._on_response_done()
         if norm.kind == "error":
-            logger.error("Provider error: %s", norm.text)
+            if self.plan.provider != "gptlive":
+                logger.error("Provider error: %s", norm.text)
             return StepResult()
         return StepResult()
 
@@ -276,11 +293,30 @@ class RelayController:
             )
         return StepResult()
 
-    def _on_session_started(self) -> StepResult:
+    def _on_session_started(self, event: dict) -> StepResult:
         self.live_ready = True
         messages = [live_append_audio(payload) for payload in self.held_audio]
         self.held_audio.clear()
-        return StepResult(provider_messages=messages)
+        result = StepResult(provider_messages=messages)
+        if self.plan.provider != "gptlive":
+            return result
+        session = event.get("session") if isinstance(event.get("session"), dict) else {}
+        audio = session.get("audio") if isinstance(session.get("audio"), dict) else {}
+        output = audio.get("output") if isinstance(audio.get("output"), dict) else {}
+        voice = _voice_name(output.get("voice"))
+        session_id = str(session.get("id") or "")
+        audio_format = audio.get("format")
+        logger.info(
+            "GPT-Live session started id=%s model=%s voice=%s format=%s",
+            session_id or "-",
+            session.get("model") or "-",
+            voice or "-",
+            json.dumps(audio_format, default=str) if audio_format is not None else "-",
+        )
+        result.capture_provider_session = True
+        result.provider_voice = voice or None
+        result.provider_session_id = session_id or None
+        return result
 
     def _on_audio(self, norm: NormalizedEvent) -> StepResult:
         if not norm.audio_b64 or not self.stream_sid:
@@ -661,6 +697,42 @@ class RelayController:
         return f"partial-{self._partial_seq}"
 
 
+def _voice_name(voice: Any) -> str:
+    """Built-in Live voices are strings. A custom voice is ``{"id": "..."}``."""
+    if isinstance(voice, str):
+        return voice
+    if isinstance(voice, dict):
+        return str(voice.get("id") or "")
+    return ""
+
+
+def _gptlive_problem(event: dict) -> bool:
+    kind = str(event.get("type") or "")
+    if kind in {"error", "warning"} or "warning" in kind:
+        return True
+    inner = event.get("event")
+    if isinstance(inner, dict):
+        inner_kind = str(inner.get("type") or "")
+        return inner_kind in {"error", "warning"} or "warning" in inner_kind
+    return False
+
+
+def _redact_audio(value: Any) -> Any:
+    """Drop audio bytes from a provider event before it is written to the log."""
+    if isinstance(value, dict):
+        kind = str(value.get("type") or "")
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "audio" or (key == "delta" and "audio" in kind):
+                cleaned[key] = "<audio>"
+            else:
+                cleaned[key] = _redact_audio(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_redact_audio(item) for item in value]
+    return value
+
+
 def _iso_now() -> str:
     from datetime import datetime, timezone
 
@@ -735,6 +807,15 @@ async def run_relay(
                 await store.append_transcript(controller.call_id, result.transcripts)
             except Exception:
                 logger.exception("Failed to append transcript.")
+        if result.capture_provider_session:
+            try:
+                await store.record_provider_session(
+                    controller.call_id,
+                    voice=result.provider_voice,
+                    session_id=result.provider_session_id,
+                )
+            except Exception:
+                logger.exception("Failed to store the GPT-Live session.")
         if result.opt_out_reason is not None:
             try:
                 await store.record_opt_out(

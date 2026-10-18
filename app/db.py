@@ -88,6 +88,9 @@ class CallRow(Base):
     brief: Mapped[str] = mapped_column(Text, default="", server_default=text("''"))
     timezone: Mapped[str] = mapped_column(String(64), default="Australia/Sydney")
     provider: Mapped[str] = mapped_column(String(16), default="")
+    # Resolved by the voice provider after session start. Empty until then.
+    provider_voice: Mapped[str | None] = mapped_column(String(128))
+    provider_session_id: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(32), default="created", index=True)
     amd_result: Mapped[str | None] = mapped_column(String(64))
     end_reason: Mapped[str | None] = mapped_column(String(64))
@@ -184,6 +187,8 @@ def call_to_dict(row: CallRow) -> dict[str, Any]:
         "brief": row.brief or "",
         "timezone": row.timezone,
         "provider": row.provider,
+        "provider_voice": row.provider_voice,
+        "provider_session_id": row.provider_session_id,
         "status": row.status,
         "amd_result": row.amd_result,
         "end_reason": row.end_reason,
@@ -213,6 +218,8 @@ def public_call(row: dict[str, Any], *, include_stream_token: bool = False) -> d
         "notes": row["notes"],
         "timezone": row["timezone"],
         "provider": row["provider"],
+        "provider_voice": row.get("provider_voice"),
+        "provider_session_id": row.get("provider_session_id"),
         "status": row["status"],
         "amd_result": row["amd_result"],
         "end_reason": row["end_reason"],
@@ -292,6 +299,8 @@ _ADDED_CALL_COLUMNS = {
     "stream_open": "INTEGER NOT NULL DEFAULT 0",
     "transcript_posted": "INTEGER NOT NULL DEFAULT 0",
     "brief": "TEXT NOT NULL DEFAULT ''",
+    "provider_voice": "VARCHAR(128)",
+    "provider_session_id": "VARCHAR(128)",
 }
 
 
@@ -548,6 +557,24 @@ class Database:
             if row.answered_at is None:
                 row.answered_at = _utcnow()
             row.stream_pending = 1
+            await session.commit()
+
+    async def record_provider_session(
+        self,
+        call_id: str,
+        *,
+        voice: str | None,
+        session_id: str | None,
+    ) -> None:
+        """Store the voice and session id the provider resolved at startup."""
+        async with self._begin() as session:
+            row = await session.get(CallRow, call_id)
+            if row is None:
+                return
+            if voice:
+                row.provider_voice = voice[:128]
+            if session_id:
+                row.provider_session_id = session_id[:128]
             await session.commit()
 
     async def mark_in_progress(self, call_id: str) -> None:

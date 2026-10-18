@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.db import Database
+from app.db import Database, public_call
 from app.transcript_webhook import (
     RETRY_DELAYS_SECONDS,
     WEBHOOK_TIMEOUT_SECONDS,
@@ -276,7 +276,13 @@ async def test_new_columns_are_added_to_an_existing_calls_table(tmp_path):
         async with db.engine.connect() as connection:
             rows = (await connection.execute(_pragma())).all()
         names = {row[1] for row in rows}
-        assert {"stream_pending", "stream_open", "transcript_posted"} <= names
+        assert {
+            "stream_pending",
+            "stream_open",
+            "transcript_posted",
+            "provider_voice",
+            "provider_session_id",
+        } <= names
         created = await _seed(db, id="legacy", stream_token="token-legacy", call_sid="CALEGACY")
         assert created["transcript_posted"] is False
         claimed = await db.claim_transcript_webhook("legacy")
@@ -417,3 +423,27 @@ def _pragma():
     from sqlalchemy import text
 
     return text("PRAGMA table_info(calls)")
+
+
+@pytest.mark.asyncio
+async def test_resolved_gptlive_voice_is_on_the_call_record(tmp_path):
+    settings = make_settings(tmp_path)
+    db = Database(settings)
+    await db.connect()
+    try:
+        created = await _seed(db, provider="gptlive", status="in-progress")
+        assert created["provider_voice"] is None
+        assert created["provider_session_id"] is None
+        await db.record_provider_session(
+            "call-1",
+            voice="ripple",
+            session_id="live_abc123",
+        )
+        stored = await db.get("call-1")
+        assert stored["provider_voice"] == "ripple"
+        assert stored["provider_session_id"] == "live_abc123"
+        shown = public_call(stored)
+        assert shown["provider_voice"] == "ripple"
+        assert shown["provider_session_id"] == "live_abc123"
+    finally:
+        await db.dispose()

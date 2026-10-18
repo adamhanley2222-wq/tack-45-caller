@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 
 import pytest
 from starlette.websockets import WebSocketDisconnect
@@ -128,6 +129,76 @@ def test_gptlive_holds_audio_until_session_started_then_appends_pcmu():
     assert nxt.provider_messages == [
         {"type": "session.input_audio.append", "audio": "BBBB"}
     ]
+
+
+def test_gptlive_session_started_logs_and_keeps_the_resolved_voice(caplog):
+    caplog.set_level(logging.INFO, logger="tack45.relay")
+    relay = gpt_controller()
+    start(relay)
+    ready = relay.on_provider(
+        {
+            "type": "session.started",
+            "session": {
+                "id": "live_abc123",
+                "model": "gpt-live-1",
+                "audio": {
+                    "format": {"type": "audio/pcmu", "rate": 8000},
+                    "output": {"voice": "ripple"},
+                },
+            },
+        }
+    )
+    assert ready.capture_provider_session is True
+    assert ready.provider_voice == "ripple"
+    assert ready.provider_session_id == "live_abc123"
+    assert "live_abc123" in caplog.text
+    assert "ripple" in caplog.text
+    assert "gpt-live-1" in caplog.text
+    assert "audio/pcmu" in caplog.text
+
+    custom = gpt_controller()
+    start(custom)
+    resolved = custom.on_provider(
+        {
+            "type": "session.started",
+            "session": {
+                "id": "live_custom",
+                "model": "gpt-live-1",
+                "audio": {"output": {"voice": {"id": "voice_123"}}},
+            },
+        }
+    )
+    assert resolved.provider_voice == "voice_123"
+    assert resolved.provider_session_id == "live_custom"
+
+
+def test_gptlive_problem_events_are_logged_without_audio(caplog):
+    caplog.set_level(logging.WARNING, logger="tack45.relay")
+    relay = gpt_controller()
+    start(relay)
+    relay.on_provider(
+        {
+            "type": "error",
+            "error": {"message": "unknown voice", "code": "invalid_voice"},
+            "audio": "QQQQBASE64AUDIO",
+        }
+    )
+    relay.on_provider({"type": "warning", "warning": {"message": "voice not applied"}})
+    relay.on_provider(
+        {
+            "type": "response.event",
+            "event": {
+                "type": "session.output_audio.delta",
+                "delta": "SHOULDNOTLOG",
+            },
+        }
+    )
+    text = caplog.text
+    assert "unknown voice" in text
+    assert "voice not applied" in text
+    assert "QQQQBASE64AUDIO" not in text
+    assert "SHOULDNOTLOG" not in text
+    assert all(record.levelno == logging.WARNING for record in caplog.records)
 
 
 def test_gptlive_transcript_deltas_become_one_line_per_turn():

@@ -240,6 +240,9 @@ def _gptlive_session(settings: Settings, instructions: str, opener: str) -> dict
             "instructions": instructions + _LIVE_TOOL_POLICY,
             "audio": {
                 "format": {"type": "audio/pcmu", "rate": 8000},
+                # Built-in voices, including ripple, are the API name as a string.
+                # A custom voice would be {"id": "voice_..."}. The default if this
+                # is omitted is marin.
                 "output": {"voice": settings.gptlive_voice},
             },
             "delegation": {
