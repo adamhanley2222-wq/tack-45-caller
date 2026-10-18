@@ -230,12 +230,14 @@ async def create_call(request: Request) -> JSONResponse:
         from_number = normalize_phone(settings.twilio_from_number)
     except PhoneError:
         from_number = settings.twilio_from_number
+    test_numbers = guards.load_test_numbers(settings.test_numbers_path, settings.test_numbers)
     decision = guards.evaluate_dial(
         number=number,
         timezone_name=timezone_name,
         moment=guards.utcnow(),
         blocked_numbers=blocked,
         from_number=from_number,
+        test_numbers=test_numbers,
     )
     call_id = str(uuid4())
     token = secrets.token_urlsafe(32)

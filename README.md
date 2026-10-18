@@ -85,6 +85,8 @@ Area codes `02`, `03`, and `07` select Sydney, Melbourne, and Brisbane. Mobiles 
 
 `data/do_not_call.txt` is one number per line (`#` comments allowed). It is re-read before every dial. Opt-outs from a live call are written to the `do_not_call` table and block the next attempt even if the file is unchanged. This list is yours to maintain; it is not the ACMA Do Not Call Register. Wash campaign numbers against that register before you dial.
 
+`config/test_numbers.txt` is one number per line (`#` comments allowed). Those numbers skip the calling-hours check only, including Sundays and national holidays. The do-not-call list and the refusal to dial the caller ID still apply. `TEST_NUMBERS` is an optional comma-separated addition to that file. Both are re-read before every dial.
+
 ## Voice providers
 
 `VOICE_PROVIDER=grok` (default) or `openai`.
@@ -131,6 +133,8 @@ When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The 
 | `DATABASE_URL` | no | Postgres URL. Empty uses SQLite |
 | `SQLITE_PATH` | no | Default `data/calls.db` |
 | `DO_NOT_CALL_PATH` | no | Default `data/do_not_call.txt` |
+| `TEST_NUMBERS_PATH` | no | Default `config/test_numbers.txt`. These numbers skip calling hours only |
+| `TEST_NUMBERS` | no | Comma-separated numbers added to that file |
 | `DEFAULT_TIMEZONE` | no | Default `Australia/Sydney` |
 | `PROMPT_PATH` | no | Default `prompts/system.txt` |
 | `OPENER_PATH` | no | Default `prompts/compliance_opener.txt` |

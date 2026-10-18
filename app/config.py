@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     database_url: str = ""
     sqlite_path: str = "data/calls.db"
     do_not_call_path: str = "data/do_not_call.txt"
+    test_numbers_path: str = "config/test_numbers.txt"
+    # Comma-separated E.164 numbers, added to the test-number file.
+    test_numbers: str = ""
     default_timezone: str = "Australia/Sydney"
 
     prompt_path: str = "prompts/system.txt"

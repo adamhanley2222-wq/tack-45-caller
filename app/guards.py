@@ -14,11 +14,17 @@ to the next free weekday.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import holidays
+
+from app.phones import PhoneError, normalize_phone
+
+logger = logging.getLogger("tack45.guards")
 
 _SUBSTITUTED = frozenset(
     {"New Year's Day", "Australia Day", "Christmas Day", "Boxing Day"}
@@ -117,6 +123,27 @@ def calling_window(
     )
 
 
+def load_test_numbers(path: str, extra: str = "") -> set[str]:
+    """E.164 numbers that skip calling hours. File lines plus comma-separated extras."""
+    numbers: set[str] = set()
+    file = Path(path)
+    raw_lines: list[str] = []
+    if file.is_file():
+        raw_lines.extend(file.read_text(encoding="utf-8").splitlines())
+    else:
+        logger.warning("Test-number file not found at %s; treating it as empty.", path)
+    raw_lines.extend(part.strip() for part in (extra or "").split(",") if part.strip())
+    for line in raw_lines:
+        stripped = line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        try:
+            numbers.add(normalize_phone(stripped))
+        except PhoneError:
+            logger.warning("Skipping unreadable test number: %s", stripped)
+    return numbers
+
+
 def evaluate_dial(
     *,
     number: str,
@@ -125,8 +152,13 @@ def evaluate_dial(
     blocked_numbers: set[str],
     from_number: str,
     calendar: NationalHolidayCalendar | None = None,
+    test_numbers: set[str] | None = None,
 ) -> GuardResult:
-    """Combine the do-not-call list and the calling window."""
+    """Combine the do-not-call list and the calling window.
+
+    A test number skips the calling window only. Self-dial and do-not-call
+    still refuse the call.
+    """
     if number == from_number:
         return GuardResult(
             False,
@@ -139,4 +171,7 @@ def evaluate_dial(
             "do_not_call",
             f"{number} is on the do-not-call list.",
         )
+    if number in (test_numbers or set()):
+        logger.info("Calling-hours exemption for test number %s", number)
+        return GuardResult(True, "ok", "Test number; calling hours not applied.")
     return calling_window(moment, timezone_name, calendar)

@@ -82,6 +82,41 @@ def test_create_call_uses_async_amd_and_api_key(client, monkeypatch):
     assert stored.json()["status"] == "initiated"
 
 
+def test_test_number_is_allowed_on_sunday_unless_do_not_call(client, monkeypatch):
+    http, seen, settings = client
+    sunday = datetime(2026, 1, 18, 0, 0, tzinfo=timezone.utc)  # 11:00 Sunday Sydney
+    monkeypatch.setattr("app.guards.utcnow", lambda: sunday)
+
+    allowed = http.post(
+        "/calls",
+        json={"to": "+61425229662", "name": "Adam"},
+        headers=_auth(),
+    )
+    assert allowed.status_code == 201, allowed.text
+    assert allowed.json()["to"] == "+61425229662"
+    assert len(seen["requests"]) == 1
+
+    refused = http.post(
+        "/calls",
+        json={"to": "+61280001111", "name": "Pat"},
+        headers=_auth(),
+    )
+    assert refused.status_code == 403
+    assert refused.json()["code"] == "outside_calling_hours"
+    assert len(seen["requests"]) == 1
+
+    with open(settings.do_not_call_path, "w", encoding="utf-8") as handle:
+        handle.write("+61425229662\n")
+    blocked = http.post(
+        "/calls",
+        json={"to": "+61425229662", "name": "Adam"},
+        headers=_auth(),
+    )
+    assert blocked.status_code == 403
+    assert blocked.json()["code"] == "do_not_call"
+    assert len(seen["requests"]) == 1
+
+
 def test_refuses_sunday_and_do_not_call(client, monkeypatch, tmp_path):
     http, seen, settings = client
     sunday = datetime(2026, 1, 18, 0, 0, tzinfo=timezone.utc)  # 11:00 Sunday Sydney

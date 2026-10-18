@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.guards import NationalHolidayCalendar, calling_window, evaluate_dial
+from app.guards import NationalHolidayCalendar, calling_window, evaluate_dial, load_test_numbers
 from app.phones import PhoneError, infer_timezone, normalize_phone
 
 SYDNEY = "Australia/Sydney"
@@ -108,6 +109,54 @@ def test_do_not_call_and_self_dial_beat_an_open_window():
         from_number="+61290904464",
     )
     assert allowed.allowed is True
+
+
+def test_test_number_skips_sunday_but_not_do_not_call(caplog):
+    sunday = at(2026, 1, 18, 11, 0)
+    listed = {"+61425229662"}
+    with caplog.at_level(logging.INFO, logger="tack45.guards"):
+        allowed = evaluate_dial(
+            number="+61425229662",
+            timezone_name=SYDNEY,
+            moment=sunday,
+            blocked_numbers=set(),
+            from_number="+61290904464",
+            test_numbers=listed,
+        )
+    assert allowed.allowed is True
+    assert "Calling-hours exemption for test number +61425229662" in caplog.text
+
+    refused = evaluate_dial(
+        number="+61280001111",
+        timezone_name=SYDNEY,
+        moment=sunday,
+        blocked_numbers=set(),
+        from_number="+61290904464",
+        test_numbers=listed,
+    )
+    assert refused.allowed is False
+    assert refused.code == "outside_calling_hours"
+
+    blocked = evaluate_dial(
+        number="+61425229662",
+        timezone_name=SYDNEY,
+        moment=sunday,
+        blocked_numbers={"+61425229662"},
+        from_number="+61290904464",
+        test_numbers=listed,
+    )
+    assert blocked.allowed is False
+    assert blocked.code == "do_not_call"
+
+
+def test_test_numbers_file_and_env_are_combined(tmp_path):
+    path = tmp_path / "test_numbers.txt"
+    path.write_text(
+        "# internal\n+61425229662  # Adam Hanley own mobile, internal testing only\n\n",
+        encoding="utf-8",
+    )
+    numbers = load_test_numbers(str(path), "0412 000 222, not-a-number")
+    assert numbers == {"+61425229662", "+61412000222"}
 
 
 def test_normalize_australian_numbers():
