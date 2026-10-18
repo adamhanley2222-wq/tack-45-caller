@@ -20,6 +20,7 @@ phone  <->  Twilio Media Streams (audio/pcmu, 8 kHz)
                 <->  tack45-caller
                         <->  wss://api.x.ai/v1/realtime   (VOICE_PROVIDER=grok)
                         <->  wss://api.openai.com/v1/realtime  (VOICE_PROVIDER=openai)
+                        <->  wss://api.openai.com/v1/live/sessions  (VOICE_PROVIDER=gptlive)
 ```
 
 ## Run locally
@@ -89,9 +90,11 @@ Area codes `02`, `03`, and `07` select Sydney, Melbourne, and Brisbane. Mobiles 
 
 ## Voice providers
 
-`VOICE_PROVIDER=grok` (default) or `openai`.
+`VOICE_PROVIDER=grok` (default), `openai`, or `gptlive`.
 
-Both sessions request `audio/pcmu` in and out, `server_vad`, and the tools `end_call` and `record_opt_out`. Grok also enables `grok-transcribe` on input and, unless `USE_FORCE_MESSAGE=false`, speaks the opener with xAI `force_message` (verbatim TTS, not a model-written line). OpenAI has no `force_message`; the opener is requested with `response.create` instructions. See the [xAI voice agent guide](https://docs.x.ai/docs/guides/voice/agent) and the [phone cookbook](https://docs.x.ai/cookbook/examples/voice-agent-phone).
+Grok and OpenAI Realtime both request `audio/pcmu` in and out, `server_vad`, and the tools `end_call` and `record_opt_out`. Grok also enables `grok-transcribe` on input and, unless `USE_FORCE_MESSAGE=false`, speaks the opener with xAI `force_message` (verbatim TTS, not a model-written line). OpenAI has no `force_message`; the opener is requested with `response.create` instructions. See the [xAI voice agent guide](https://docs.x.ai/docs/guides/voice/agent) and the [phone cookbook](https://docs.x.ai/cookbook/examples/voice-agent-phone).
+
+`gptlive` is OpenAI GPT-Live-1 (`gpt-live-1`, voice `ripple`) on `wss://api.openai.com/v1/live/sessions`, using the same `OPENAI_API_KEY`. The session asks for `{"type":"audio/pcmu","rate":8000}` so Twilio μ-law is forwarded unchanged. The opener is a developer message inside `session.start`. `end_call` and `record_opt_out` are registered on Responses delegation (`GPTLIVE_RESPONSES_MODEL`, default `gpt-6-luna`); this server runs those tools and returns `response.item.create`. Client delegation is not used: its delegation event does not include the tool name or arguments.
 
 The opener in `prompts/compliance_opener.txt` is only `Hi, is this {first name}?`. The first name is the first word of the call's `name`. With no name it is `Hi, is that the business owner?`. The model waits. On a confirmation, the next turn must be the AI disclosure and the Tack45 identification before any pitch. A wrong person gets that identification and a request to reach the right person or a callback time, and no pitch. A no to the chat asks about removing the number. Any opt-out, at any time, calls `record_opt_out` and then `end_call`.
 
@@ -117,9 +120,9 @@ When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The 
 | `TWILIO_API_KEY_SID` | yes | API key sid (`SK...`), used as HTTP basic auth username |
 | `TWILIO_API_KEY_SECRET` | yes | API key secret |
 | `TWILIO_FROM_NUMBER` | yes | Caller ID. Use `+61290904464` |
-| `VOICE_PROVIDER` | yes | `grok` or `openai` |
+| `VOICE_PROVIDER` | yes | `grok` (default), `openai`, or `gptlive` |
 | `XAI_API_KEY` | when provider is grok | xAI key for `wss://api.x.ai/v1/realtime` |
-| `OPENAI_API_KEY` | when provider is openai | OpenAI key for the Realtime WebSocket |
+| `OPENAI_API_KEY` | when provider is openai or gptlive | OpenAI key for Realtime or GPT-Live |
 | `TWILIO_AUTH_TOKEN` | no | When set, webhooks must carry a valid `X-Twilio-Signature` |
 | `XAI_VOICE` | no | Default `eve` |
 | `OPENAI_VOICE` | no | Default `marin` |
@@ -128,6 +131,10 @@ When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The 
 | `XAI_REALTIME_URL` | no | Default `wss://api.x.ai/v1/realtime` |
 | `OPENAI_REALTIME_URL` | no | Default `wss://api.openai.com/v1/realtime` |
 | `OPENAI_TRANSCRIBE_MODEL` | no | Default `gpt-4o-mini-transcribe` |
+| `GPTLIVE_URL` | no | Default `wss://api.openai.com/v1/live/sessions`. No `model` query string |
+| `GPTLIVE_MODEL` | no | Default `gpt-live-1` |
+| `GPTLIVE_VOICE` | no | Default `ripple` |
+| `GPTLIVE_RESPONSES_MODEL` | no | Default `gpt-6-luna`. Backend that selects the call tools |
 | `XAI_REASONING_EFFORT` | no | Default `none`, to keep phone turns short |
 | `USE_FORCE_MESSAGE` | no | Default `true`. Grok opener via `force_message` |
 | `DATABASE_URL` | no | Postgres URL. Empty uses SQLite |

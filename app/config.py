@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     xai_realtime_url: str = "wss://api.x.ai/v1/realtime"
     openai_realtime_url: str = "wss://api.openai.com/v1/realtime"
     openai_transcribe_model: str = "gpt-4o-mini-transcribe"
+    # GPT-Live (VOICE_PROVIDER=gptlive). Off unless that provider is selected.
+    gptlive_url: str = "wss://api.openai.com/v1/live/sessions"
+    gptlive_model: str = "gpt-live-1"
+    gptlive_voice: str = "ripple"
+    # Responses backend that selects end_call / record_opt_out. The Live
+    # delegation guide names gpt-6-luna; the WebSocket guide's example uses
+    # gpt-5.6-luna. Override if session start returns responses_validation_failed.
+    gptlive_responses_model: str = "gpt-6-luna"
     # Phone calls should not wait on a long reasoning pass.
     xai_reasoning_effort: str = "none"
     use_force_message: bool = True
@@ -87,6 +95,8 @@ def missing_dial_configuration(settings: Settings) -> list[str]:
         missing.append("XAI_API_KEY")
     elif provider == "openai" and not settings.openai_api_key:
         missing.append("OPENAI_API_KEY")
-    elif provider not in {"grok", "openai"}:
+    elif provider == "gptlive" and not settings.openai_api_key:
+        missing.append("OPENAI_API_KEY")
+    elif provider not in {"grok", "openai", "gptlive"}:
         missing.append("VOICE_PROVIDER")
     return missing

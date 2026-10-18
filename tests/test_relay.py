@@ -51,6 +51,22 @@ def test_start_does_not_send_the_session_twice():
     assert started.transcripts[0]["text"] == "Hi, this is an AI assistant."
 
 
+def gpt_controller(clock: Clock | None = None) -> RelayController:
+    plan = SessionPlan(
+        setup_messages=[{"type": "session.start", "session": {"model": "gpt-live-1"}}],
+        provider="gptlive",
+    )
+    return RelayController(
+        call_id="call-1",
+        call_sid="CA1",
+        phone="+61400000000",
+        opener="Hi, is this Sam?",
+        plan=plan,
+        hangup_grace_seconds=5,
+        clock=clock or Clock(),
+    )
+
+
 def test_passthrough_forwards_mulaw_unchanged_both_ways():
     relay = controller()
     started = start(relay)
@@ -92,6 +108,192 @@ def test_opener_is_protected_then_barge_in_clears_twilio():
 
     dropped = relay.on_provider({"type": "response.output_audio.delta", "delta": "BBBB"})
     assert dropped.twilio_messages == []
+
+
+def test_gptlive_holds_audio_until_session_started_then_appends_pcmu():
+    relay = gpt_controller()
+    start(relay)
+    assert relay.live_ready is False
+    held = relay.on_twilio(
+        {"event": "media", "media": {"track": "inbound", "payload": "AAAA"}}
+    )
+    assert held.provider_messages == []
+    ready = relay.on_provider({"type": "session.started", "session": {"id": "sess_1"}})
+    assert ready.provider_messages == [
+        {"type": "session.input_audio.append", "audio": "AAAA"}
+    ]
+    nxt = relay.on_twilio(
+        {"event": "media", "media": {"track": "inbound", "payload": "BBBB"}}
+    )
+    assert nxt.provider_messages == [
+        {"type": "session.input_audio.append", "audio": "BBBB"}
+    ]
+
+
+def test_gptlive_transcript_deltas_become_one_line_per_turn():
+    relay = gpt_controller()
+    start(relay)
+    relay.on_provider({"type": "session.started"})
+    first = relay.on_provider(
+        {"type": "session.output_transcript.delta", "delta": "Hi ", "start_ms": 0, "end_ms": 200}
+    )
+    assert first.transcripts[-1]["text"] == "Hi"
+    second = relay.on_provider(
+        {
+            "type": "session.output_transcript.delta",
+            "delta": "there.",
+            "start_ms": 200,
+            "end_ms": 500,
+        }
+    )
+    assert second.transcripts[-1]["role"] == "assistant"
+    assert second.transcripts[-1]["text"] == "Hi there."
+    caller = relay.on_provider(
+        {
+            "type": "session.input_transcript.delta",
+            "delta": "Yes it is.",
+            "start_ms": 2000,
+            "end_ms": 2600,
+        }
+    )
+    assert caller.transcripts[-1] == {
+        "role": "caller",
+        "text": "Yes it is.",
+        "at": caller.transcripts[-1]["at"],
+        "utterance_id": caller.transcripts[-1]["utterance_id"],
+    }
+    later = relay.on_provider(
+        {
+            "type": "session.output_transcript.delta",
+            "delta": "Sure.",
+            "start_ms": 4000,
+            "end_ms": 4300,
+        }
+    )
+    roles = [(line["role"], line["text"]) for line in relay.transcript]
+    assert ("assistant", "Hi, is this Sam?") in roles
+    assert ("assistant", "Hi there.") in roles
+    assert ("caller", "Yes it is.") in roles
+    assert ("assistant", "Sure.") in roles
+    assert later.transcripts[-1]["text"] == "Sure."
+    assert later.transcripts[-1]["utterance_id"] != second.transcripts[-1]["utterance_id"]
+
+
+def test_gptlive_barge_in_clears_twilio_without_muting_the_reply():
+    clock = Clock()
+    relay = gpt_controller(clock)
+    start(relay)
+    relay.on_provider({"type": "session.started"})
+    relay.on_provider({"type": "session.output_audio.delta", "delta": "AAAA"})
+    during_opener = relay.on_provider(
+        {
+            "type": "session.input_transcript.delta",
+            "delta": "hello",
+            "start_ms": 0,
+            "end_ms": 200,
+        }
+    )
+    assert during_opener.twilio_messages == []
+    assert during_opener.drop_queued_audio is False
+
+    clock.now = 0.1
+    relay.on_provider(
+        {
+            "type": "session.input_transcript.delta",
+            "delta": " there",
+            "start_ms": 200,
+            "end_ms": 400,
+        }
+    )
+    assert relay.protecting_opener is False
+    relay.on_provider({"type": "session.output_audio.delta", "delta": "CCCC", "start_ms": 5000})
+    barge = relay.on_provider(
+        {
+            "type": "session.input_transcript.delta",
+            "delta": "wait",
+            "start_ms": 5000,
+            "end_ms": 5400,
+        }
+    )
+    assert barge.drop_queued_audio is True
+    assert barge.twilio_messages == [{"event": "clear", "streamSid": "MZ1"}]
+    assert relay.interrupted is False
+
+    stale = relay.on_provider(
+        {"type": "session.output_audio.delta", "delta": "DDDD", "start_ms": 1000}
+    )
+    assert stale.twilio_messages == []
+    fresh = relay.on_provider(
+        {"type": "session.output_audio.delta", "delta": "EEEE", "start_ms": 6000}
+    )
+    assert fresh.twilio_messages[0]["media"]["payload"] == "EEEE"
+    created = relay.on_provider(
+        {"type": "response.event", "event": {"type": "response.created"}}
+    )
+    assert created.twilio_messages == []
+    assert relay.interrupted is False
+
+
+def test_gptlive_tools_use_response_item_create_and_close_after_playback():
+    relay = gpt_controller()
+    start(relay)
+    relay.on_provider({"type": "session.started"})
+    relay.on_provider({"type": "session.output_audio.delta", "delta": "AAAA"})
+    relay.on_provider(
+        {
+            "type": "response.event",
+            "event": {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "name": "end_call",
+                    "call_id": "call_1",
+                    "arguments": json.dumps({"reason": "goodbye"}),
+                },
+            },
+        }
+    )
+    done = relay.on_provider(
+        {"type": "response.event", "event": {"type": "response.completed", "response": {"output": []}}}
+    )
+    assert done.hangup is False
+    assert done.provider_messages[0]["type"] == "response.item.create"
+    assert done.provider_messages[0]["item"]["type"] == "function_call_output"
+    assert done.provider_messages[0]["item"]["call_id"] == "call_1"
+    assert all(message["type"] != "session.close" for message in done.provider_messages)
+    assert all(message["type"] != "conversation.item.create" for message in done.provider_messages)
+    mark = done.twilio_messages[0]
+    assert mark["event"] == "mark"
+    echoed = relay.on_twilio(
+        {"event": "mark", "mark": {"name": mark["mark"]["name"]}, "streamSid": "MZ1"}
+    )
+    assert echoed.hangup is True
+    assert echoed.provider_messages == [{"type": "session.close", "event_id": "event_close"}]
+
+    opted = gpt_controller()
+    start(opted)
+    opted.on_provider({"type": "session.started"})
+    opted.on_provider(
+        {
+            "type": "response.event",
+            "event": {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "name": "record_opt_out",
+                    "call_id": "call_2",
+                    "arguments": {"reason": "not interested"},
+                },
+            },
+        }
+    )
+    finished = opted.on_provider(
+        {"type": "response.event", "event": {"type": "response.done", "response": {"output": []}}}
+    )
+    assert finished.opt_out_reason == "not interested"
+    assert finished.provider_messages[0]["item"]["type"] == "function_call_output"
+    assert finished.provider_messages[1] == {"type": "response.create"}
+    assert all(message["type"] != "session.close" for message in finished.provider_messages)
 
 
 def test_end_call_waits_for_playback_mark_then_hangs_up():

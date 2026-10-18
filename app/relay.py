@@ -25,13 +25,22 @@ from app.providers import (
     append_audio,
     function_calls_in_response,
     function_output,
+    live_append_audio,
+    live_function_output,
     normalize_event,
     response_create,
+    session_close,
 )
 
 logger = logging.getLogger("tack45.relay")
 
 _MULAW_RATE = 8000
+# Long enough for "Hi, is this {name}?" and the no-name owner check.
+# GPT-Live has no opener response boundary, so protection cannot wait forever.
+_GPTLIVE_OPENER_PROTECT_SECONDS = 4.0
+# Transcript deltas have no turn-complete event. A gap in the session timeline
+# starts a new stored line. Delivery delay does not move start_ms.
+_GPTLIVE_TURN_GAP_MS = 700
 
 
 class CallStore(Protocol):
@@ -152,6 +161,17 @@ class RelayController:
         self.mark_purpose: str | None = None
         self.hangup_deadline: float | None = None
         self._partial_seq = 0
+        # GPT-Live rejects audio until session.started. Grok and Realtime do not.
+        self.live_ready = plan.provider != "gptlive"
+        self.held_audio: list[str] = []
+        self.playback_until = 0.0
+        self.playback_started_at: float | None = None
+        self.drop_output_before_ms: int | None = None
+        self.session_close_sent = False
+        self._live_turns = {
+            "caller": {"id": None, "text": "", "end_ms": None},
+            "assistant": {"id": None, "text": "", "end_ms": None},
+        }
 
     def on_twilio(self, message: dict) -> StepResult:
         event = message.get("event")
@@ -166,11 +186,20 @@ class RelayController:
         if event == "stop":
             if not self.hangup_requested and self.end_reason == "completed":
                 self.end_reason = "caller_hangup"
-            return StepResult(stop=True, end_reason=self.end_reason, hangup=False)
+            return StepResult(
+                provider_messages=self._session_close_messages(),
+                stop=True,
+                end_reason=self.end_reason,
+                hangup=False,
+            )
         return StepResult()
 
     def on_provider(self, event: dict) -> StepResult:
         norm = normalize_event(event)
+        if norm.kind == "session_started":
+            return self._on_session_started()
+        if norm.kind == "session_closed":
+            return StepResult()
         if norm.kind == "audio":
             return self._on_audio(norm)
         if norm.kind == "speech_started":
@@ -185,8 +214,7 @@ class RelayController:
         if norm.kind == "response_created":
             return self._on_response_created()
         if norm.kind == "response_done":
-            for item in function_calls_in_response(event):
-                self._remember_tool(item["name"], item["arguments"], item["call_id"])
+            self._collect_function_calls(event)
             return self._on_response_done()
         if norm.kind == "error":
             logger.error("Provider error: %s", norm.text)
@@ -219,6 +247,11 @@ class RelayController:
         if not payload:
             return StepResult()
         forwarded = passthrough_audio(payload)
+        if self.plan.provider == "gptlive":
+            if not self.live_ready:
+                self.held_audio.append(forwarded)
+                return StepResult()
+            return StepResult(provider_messages=[live_append_audio(forwarded)])
         return StepResult(provider_messages=[append_audio(forwarded)])
 
     def _on_mark(self, message: dict) -> StepResult:
@@ -235,15 +268,45 @@ class RelayController:
             return StepResult(provider_messages=[response_create()])
         if purpose == "hangup":
             self.hangup_deadline = None
-            return StepResult(hangup=True, stop=True, end_reason=self.end_reason)
+            return StepResult(
+                provider_messages=self._session_close_messages(),
+                hangup=True,
+                stop=True,
+                end_reason=self.end_reason,
+            )
         return StepResult()
+
+    def _on_session_started(self) -> StepResult:
+        self.live_ready = True
+        messages = [live_append_audio(payload) for payload in self.held_audio]
+        self.held_audio.clear()
+        return StepResult(provider_messages=messages)
 
     def _on_audio(self, norm: NormalizedEvent) -> StepResult:
         if not norm.audio_b64 or not self.stream_sid:
             return StepResult()
+        if (
+            self.drop_output_before_ms is not None
+            and norm.start_ms is not None
+            and norm.start_ms < self.drop_output_before_ms
+        ):
+            return StepResult()
+        if (
+            self.drop_output_before_ms is not None
+            and norm.start_ms is not None
+            and norm.start_ms >= self.drop_output_before_ms
+        ):
+            self.drop_output_before_ms = None
         if self.interrupted:
             return StepResult()
         payload = passthrough_audio(norm.audio_b64)
+        if self.plan.provider == "gptlive":
+            now = self.clock()
+            if self.playback_started_at is None:
+                self.playback_started_at = now
+            if now > self.playback_until:
+                self.playback_until = now
+            self.playback_until += payload_nbytes(payload) / _MULAW_RATE
         now = self.clock()
         if self.response_first_audio_at is None:
             self.response_first_audio_at = now
@@ -279,6 +342,8 @@ class RelayController:
         )
 
     def _on_user_transcript(self, norm: NormalizedEvent) -> StepResult:
+        if self.plan.provider == "gptlive":
+            return self._on_gptlive_transcript("caller", norm)
         item_id = self._caller_utterance_id(norm.item_id)
         if norm.final:
             text = norm.text or self.user_partials.pop(item_id, "")
@@ -295,6 +360,8 @@ class RelayController:
         return StepResult()
 
     def _on_assistant_transcript(self, norm: NormalizedEvent) -> StepResult:
+        if self.plan.provider == "gptlive":
+            return self._on_gptlive_transcript("assistant", norm)
         if norm.final:
             self.assistant_parts.clear()
             utterance_id = norm.item_id or self._assistant_utterance_id
@@ -338,6 +405,9 @@ class RelayController:
 
         if self.hangup_requested:
             if interrupted or not had_audio:
+                # Playback is already finished, so closing the Live session
+                # cannot cut off audio still in Twilio's buffer.
+                result.provider_messages.extend(self._session_close_messages())
                 result.hangup = True
                 result.stop = True
                 result.end_reason = self.end_reason
@@ -367,7 +437,7 @@ class RelayController:
             self.opt_out_reason = reason
             self.end_reason = "opt_out"
             return (
-                function_output(
+                self._tool_result(
                     call_id,
                     {
                         "ok": True,
@@ -382,7 +452,7 @@ class RelayController:
             if not self.opted_out:
                 self.end_reason = f"end_call:{reason}"[:64]
             return (
-                function_output(
+                self._tool_result(
                     call_id,
                     {
                         "ok": True,
@@ -392,9 +462,97 @@ class RelayController:
                 None,
             )
         return (
-            function_output(call_id, {"ok": False, "error": f"Unknown tool {name}"}),
+            self._tool_result(call_id, {"ok": False, "error": f"Unknown tool {name}"}),
             None,
         )
+
+    def _tool_result(self, call_id: str, payload: dict) -> dict:
+        if self.plan.provider == "gptlive":
+            return live_function_output(call_id, payload)
+        return function_output(call_id, payload)
+
+    def _session_close_messages(self) -> list[dict]:
+        if self.plan.provider != "gptlive" or self.session_close_sent:
+            return []
+        self.session_close_sent = True
+        return [session_close()]
+
+    def _collect_function_calls(self, event: dict) -> None:
+        sources = [event]
+        inner = event.get("event")
+        if isinstance(inner, dict):
+            sources.append(inner)
+        for source in sources:
+            for item in function_calls_in_response(source):
+                self._remember_tool(item["name"], item["arguments"], item["call_id"])
+
+    def _on_gptlive_transcript(self, role: str, norm: NormalizedEvent) -> StepResult:
+        barge = self._gptlive_barge_in(norm) if role == "caller" else StepResult()
+        text = self._append_live_fragment(role, norm)
+        if not text:
+            return barge
+        line = self._commit(role, text, utterance_id=self._live_turns[role]["id"])
+        if line:
+            barge.transcripts.append(line)
+        return barge
+
+    def _append_live_fragment(self, role: str, norm: NormalizedEvent) -> str:
+        slot = self._live_turns[role]
+        start = norm.start_ms
+        new_turn = slot["id"] is None or (
+            start is not None
+            and slot["end_ms"] is not None
+            and start >= slot["end_ms"] + _GPTLIVE_TURN_GAP_MS
+        )
+        if new_turn:
+            if not norm.text:
+                return ""
+            slot["id"] = self._next_partial_id()
+            slot["text"] = ""
+            slot["end_ms"] = None
+        if norm.text:
+            slot["text"] += norm.text
+        if norm.end_ms is not None:
+            slot["end_ms"] = norm.end_ms
+        elif start is not None:
+            slot["end_ms"] = start
+        return slot["text"]
+
+    def _gptlive_barge_in(self, norm: NormalizedEvent) -> StepResult:
+        """Clear Twilio's buffer when the caller talks over playback.
+
+        GPT-Live has no speech-started event and no per-turn response.created.
+        ``interrupted`` is left false so later output deltas still play.
+        """
+        now = self.clock()
+        if self._gptlive_opener_blocks(now) or self.hangup_requested:
+            return StepResult()
+        if now >= self.playback_until:
+            return StepResult()
+        self.playback_until = now
+        self.audio_bytes = 0
+        self.response_first_audio_at = None
+        if norm.start_ms is not None:
+            self.drop_output_before_ms = norm.start_ms
+        if not self.stream_sid:
+            return StepResult(drop_queued_audio=True)
+        return StepResult(
+            drop_queued_audio=True,
+            twilio_messages=[{"event": "clear", "streamSid": self.stream_sid}],
+        )
+
+    def _gptlive_opener_blocks(self, now: float) -> bool:
+        if not self.protecting_opener:
+            return False
+        if self.playback_started_at is None or now < self.playback_until:
+            if self.playback_started_at is not None and now >= (
+                self.playback_started_at + _GPTLIVE_OPENER_PROTECT_SECONDS
+            ):
+                self.protecting_opener = False
+                return False
+            return True
+        self.protecting_opener = False
+        return False
 
     def _remember_tool(self, name: str | None, arguments: str | dict | None, call_id: str | None) -> None:
         if not name or not call_id or call_id in self.seen_tool_ids:
@@ -420,6 +578,8 @@ class RelayController:
         )
 
     def _remaining_playback(self) -> float:
+        if self.plan.provider == "gptlive":
+            return max(0.0, self.playback_until - self.clock())
         if self.response_first_audio_at is None or self.audio_bytes <= 0:
             return 0.0
         ends = self.response_first_audio_at + (self.audio_bytes / _MULAW_RATE)
@@ -543,6 +703,11 @@ async def run_relay(
             return
         finished = True
         controller.hung_up = True
+        for message in controller._session_close_messages():
+            try:
+                await provider.send(message)
+            except Exception:
+                logger.exception("Failed to close the GPT-Live session.")
         try:
             await store.finish_call(
                 controller.call_id,

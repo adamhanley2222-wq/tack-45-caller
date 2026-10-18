@@ -1,13 +1,18 @@
-"""Realtime session setup for xAI Grok Voice and OpenAI Realtime.
+"""Realtime session setup for xAI Grok Voice, OpenAI Realtime, and GPT-Live.
 
-Both providers are configured for ``audio/pcmu`` (G.711 μ-law, 8 kHz), which
-is Twilio Media Streams' native codec. The relay forwards the base64 payload
-unchanged. There is no sample-rate field on the pcmu format: 8 kHz is the
-codec, and adding a PCM rate would be a different format.
+Grok and OpenAI Realtime are configured for ``audio/pcmu`` (G.711 μ-law,
+8 kHz) with no sample-rate field: 8 kHz is the codec, and adding a PCM rate
+would be a different format. The relay forwards the base64 payload unchanged.
 
 xAI session shape follows https://docs.x.ai/docs/guides/voice/agent
 and the force_message opener in that guide. OpenAI uses the GA Realtime
 session, where ``g711_ulaw`` is named ``audio/pcmu``.
+
+GPT-Live (``VOICE_PROVIDER=gptlive``) uses ``session.start`` on
+``wss://api.openai.com/v1/live/sessions``. Its pcmu format includes
+``rate: 8000``, which is the Live API's G.711 μ-law format, not a PCM rate.
+Tools are registered on Responses delegation. The Live model does not receive
+a top-level ``tools`` field; startup rejects unknown session fields.
 """
 
 from __future__ import annotations
@@ -30,6 +35,8 @@ class NormalizedEvent:
     name: str | None = None
     arguments: str | dict | None = None
     call_id: str | None = None
+    start_ms: int | None = None
+    end_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +117,10 @@ def append_audio(payload_b64: str) -> dict:
     return {"type": "input_audio_buffer.append", "audio": payload_b64}
 
 
+def live_append_audio(payload_b64: str) -> dict:
+    return {"type": "session.input_audio.append", "audio": payload_b64}
+
+
 def function_output(call_id: str, payload: dict) -> dict:
     return {
         "type": "conversation.item.create",
@@ -121,8 +132,25 @@ def function_output(call_id: str, payload: dict) -> dict:
     }
 
 
+def live_function_output(call_id: str, payload: dict) -> dict:
+    """Tool result for GPT-Live Responses delegation. Grok and Realtime use function_output."""
+    return {
+        "type": "response.item.create",
+        "event_id": f"tool_result_{call_id}",
+        "item": {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": json.dumps(payload),
+        },
+    }
+
+
 def response_create() -> dict:
     return {"type": "response.create"}
+
+
+def session_close() -> dict:
+    return {"type": "session.close", "event_id": "event_close"}
 
 
 def realtime_ws_url(base: str, model: str) -> str:
@@ -182,6 +210,68 @@ def _openai_session(settings: Settings, instructions: str) -> dict:
     }
 
 
+_LIVE_TOOL_POLICY = (
+    "\n\nDelegation policy:\n"
+    "You speak with the caller. The responses backend calls tools; you do not invent tool results.\n"
+    "Delegate record_opt_out when they ask not to be called again, after you have confirmed that aloud.\n"
+    "Delegate end_call after your goodbye, when the conversation is finished or they want to hang up.\n"
+    "Stop speaking when the caller interrupts, then listen.\n"
+)
+
+_BACKEND_TOOL_POLICY = (
+    "\n\nYou are the tool backend for this phone call. "
+    "Call record_opt_out when the caller asks not to be called again. "
+    "Call end_call when the conversation is over or the caller wants to hang up. "
+    "Do not call any other tool.\n"
+)
+
+
+def _gptlive_session(settings: Settings, instructions: str, opener: str) -> dict:
+    """One session.start. The opener is a developer input so it is in the first message.
+
+    Responses delegation is what carries end_call and record_opt_out. Client
+    delegation's session.delegation.created event has no tool name or arguments.
+    """
+    return {
+        "type": "session.start",
+        "event_id": "event_start",
+        "session": {
+            "model": settings.gptlive_model,
+            "instructions": instructions + _LIVE_TOOL_POLICY,
+            "audio": {
+                "format": {"type": "audio/pcmu", "rate": 8000},
+                "output": {"voice": settings.gptlive_voice},
+            },
+            "delegation": {
+                "type": "responses",
+                "responses": {
+                    "model": settings.gptlive_responses_model,
+                    "instructions": instructions + _BACKEND_TOOL_POLICY,
+                    "tools": tool_definitions(),
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": False,
+                },
+            },
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Greet the caller now in English. Say exactly these words "
+                                "and nothing else, then pause and listen:\n\n"
+                                + opener
+                            ),
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
+
 def build_session_plan(settings: Settings, instructions: str, opener: str) -> SessionPlan:
     provider = settings.voice_provider.strip().lower()
     if provider == "grok":
@@ -194,6 +284,11 @@ def build_session_plan(settings: Settings, instructions: str, opener: str) -> Se
     if provider == "openai":
         messages = [_openai_session(settings, instructions), opener_response(opener)]
         return SessionPlan(setup_messages=messages, provider=provider)
+    if provider == "gptlive":
+        return SessionPlan(
+            setup_messages=[_gptlive_session(settings, instructions, opener)],
+            provider=provider,
+        )
     raise ValueError(f"Unsupported VOICE_PROVIDER: {settings.voice_provider}")
 
 
@@ -208,8 +303,84 @@ _ASSISTANT_PARTIAL = {
 }
 
 
+def _timeline_ms(event: dict, field: str) -> int | None:
+    value = event.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _error_message(event: dict) -> str:
+    detail = event.get("error")
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if message:
+            return str(message)
+        return str(detail)
+    if isinstance(detail, str) and detail:
+        return detail
+    return str(detail or event)
+
+
+def _normalize_delegated_response(event: dict) -> NormalizedEvent:
+    """Events nested in a GPT-Live ``response.event`` envelope.
+
+    ``response.created`` is ignored. GPT-Live does not use it as a spoken-turn
+    boundary, and treating it as one would drop later audio.
+    """
+    kind = event.get("type") or ""
+    if kind == "response.output_item.done":
+        item = event.get("item") or {}
+        if item.get("type") == "function_call":
+            return NormalizedEvent(
+                "function_call",
+                name=item.get("name"),
+                arguments=item.get("arguments") if item.get("arguments") is not None else "{}",
+                call_id=item.get("call_id"),
+            )
+        return NormalizedEvent("ignore", text=kind)
+    if kind in {"response.done", "response.completed"}:
+        return NormalizedEvent("response_done")
+    if kind == "error":
+        return NormalizedEvent("error", text=_error_message(event))
+    return NormalizedEvent("ignore", text=kind)
+
+
 def normalize_event(event: dict) -> NormalizedEvent:
     kind = event.get("type") or ""
+    if kind == "response.event":
+        inner = event.get("event")
+        if isinstance(inner, dict):
+            return _normalize_delegated_response(inner)
+        return NormalizedEvent("ignore", text=kind)
+    if kind == "session.output_audio.delta":
+        return NormalizedEvent(
+            "audio",
+            audio_b64=event.get("delta") or event.get("audio"),
+            start_ms=_timeline_ms(event, "start_ms"),
+        )
+    if kind == "session.input_transcript.delta":
+        return NormalizedEvent(
+            "user_transcript",
+            text=event.get("delta") or "",
+            final=False,
+            cumulative=False,
+            start_ms=_timeline_ms(event, "start_ms"),
+            end_ms=_timeline_ms(event, "end_ms"),
+        )
+    if kind == "session.output_transcript.delta":
+        return NormalizedEvent(
+            "assistant_transcript",
+            text=event.get("delta") or "",
+            final=False,
+            cumulative=False,
+            start_ms=_timeline_ms(event, "start_ms"),
+            end_ms=_timeline_ms(event, "end_ms"),
+        )
+    if kind == "session.started":
+        return NormalizedEvent("session_started")
+    if kind == "session.closed":
+        return NormalizedEvent("session_closed")
     if kind in _AUDIO_DELTAS:
         return NormalizedEvent("audio", audio_b64=event.get("delta") or event.get("audio"))
     if kind == "input_audio_buffer.speech_started":
@@ -263,9 +434,7 @@ def normalize_event(event: dict) -> NormalizedEvent:
     if kind == "response.done":
         return NormalizedEvent("response_done")
     if kind == "error":
-        detail = event.get("error")
-        text = detail if isinstance(detail, str) else str(detail or event)
-        return NormalizedEvent("error", text=text)
+        return NormalizedEvent("error", text=_error_message(event))
     return NormalizedEvent("ignore", text=kind)
 
 
@@ -294,4 +463,7 @@ def provider_connection_target(settings: Settings) -> tuple[str, dict[str, str]]
     if provider == "openai":
         url = realtime_ws_url(settings.openai_realtime_url, settings.openai_realtime_model)
         return url, {"Authorization": f"Bearer {settings.openai_api_key}"}
+    if provider == "gptlive":
+        # Live rejects a model query string. The model is session.start's session.model.
+        return settings.gptlive_url, {"Authorization": f"Bearer {settings.openai_api_key}"}
     raise ValueError(f"Unsupported VOICE_PROVIDER: {settings.voice_provider}")
