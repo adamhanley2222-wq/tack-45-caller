@@ -108,7 +108,7 @@ def test_prompt_mentions_accent_opt_out_and_placeholder():
     assert "Australian Privacy Principles" in system
     assert "adam@tack45.com.au" in system
     assert "tack45-website.pages.dev" in system
-    assert "02 9090 4464" in system
+    assert "ring back on this number" in system
     assert "Recruit Vector" in system
     assert "male Australian voice" in system
     assert "ABC-newsreader-style General Australian accent" in system
