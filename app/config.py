@@ -57,6 +57,13 @@ class Settings(BaseSettings):
 
     prompt_path: str = "prompts/system.txt"
     opener_path: str = "prompts/compliance_opener.txt"
+    # Outbound only. The session still opens immediately. The opener waits
+    # until the person called has spoken and then been quiet, or until the
+    # max wait if they never speak. Inbound calls ignore this. Same names as
+    # the opener-wait change so the two stay compatible.
+    opener_wait_for_speech: bool = True
+    opener_silence_ms: int = 500
+    opener_max_wait_ms: int = 2500
     inbound_prompt_path: str = "prompts/inbound_system.txt"
     briefs_dir: str = "prompts/briefs"
     # How far back an inbound caller is matched to an outbound call. 0 keeps all.
@@ -73,12 +80,24 @@ class Settings(BaseSettings):
     # POST /probe/tts, the cascade (VOICE_PROVIDER=gemini), and Gemini Live
     # (VOICE_PROVIDER=geminilive). Grok, OpenAI, and GPT-Live do not read it.
     gemini_api_key: str = ""
-    # POST /probe/tts with provider "cloudtts" only. Calls do not read it.
+    # POST /probe/tts with provider "cloudtts", and VOICE_PROVIDER=pipeline.
     # Preferred credential: the full service-account JSON key. Not logged.
     google_tts_credentials_json: str = Field(default="", repr=False)
     # Fallback only when GOOGLE_TTS_CREDENTIALS_JSON is empty.
     # Chirp 3 HD rejects API keys with 401.
     google_tts_api_key: str = ""
+    # Same service-account JSON, used by VOICE_PROVIDER=pipeline when
+    # GOOGLE_TTS_CREDENTIALS_JSON is empty. Not logged.
+    google_cloud_credentials_json: str = Field(default="", repr=False)
+    # VOICE_PROVIDER=pipeline. Gemini text model, one streaming request per turn.
+    pipeline_llm_model: str = "gemini-2.5-flash"
+    pipeline_tts_voice: str = "en-AU-Chirp3-HD-Charon"
+    # Speech-to-Text v2. telephony + global accepts 8 kHz μ-law en-AU.
+    pipeline_stt_model: str = "telephony"
+    pipeline_stt_language: str = "en-AU"
+    pipeline_stt_location: str = "global"
+    # Silence after the caller stops before the final transcript closes the turn.
+    pipeline_stt_endpoint_ms: int = 500
     # Cascaded Gemini provider. Ignored unless VOICE_PROVIDER=gemini.
     deepgram_api_key: str = ""
     deepgram_url: str = "wss://api.deepgram.com/v1/listen"
@@ -140,6 +159,13 @@ def missing_dial_configuration(settings: Settings) -> list[str]:
     elif provider == "geminilive":
         if not settings.gemini_api_key:
             missing.append("GEMINI_API_KEY")
-    elif provider not in {"grok", "openai", "gptlive", "gemini", "geminilive"}:
+    elif provider == "pipeline":
+        if not settings.gemini_api_key:
+            missing.append("GEMINI_API_KEY")
+        if not (settings.google_tts_credentials_json or "").strip() and not (
+            settings.google_cloud_credentials_json or ""
+        ).strip():
+            missing.append("GOOGLE_TTS_CREDENTIALS_JSON")
+    elif provider not in {"grok", "openai", "gptlive", "gemini", "geminilive", "pipeline"}:
         missing.append("VOICE_PROVIDER")
     return missing

@@ -1,6 +1,6 @@
 # tack45-caller
 
-Outbound AI voice calls for Tack45, a Sydney AI consultancy. The service dials an Australian business on a Twilio number, waits for async answering-machine detection, and on a human answer bridges the call to a realtime speech-to-speech model. The same relay answers inbound calls to that number. Twilio audio stays 8 kHz G.711 μ-law. Grok, OpenAI, GPT-Live, and the Gemini cascade pass that payload through. Gemini Live (`VOICE_PROVIDER=geminilive`) resamples it: 16 kHz PCM into the Live API, and 24 kHz PCM back to 8 kHz μ-law.
+Outbound AI voice calls for Tack45, a Sydney AI consultancy. The service dials an Australian business on a Twilio number, waits for async answering-machine detection, and on a human answer bridges the call to a realtime speech-to-speech model. The same relay answers inbound calls to that number. Twilio audio stays 8 kHz G.711 μ-law. Grok, OpenAI, GPT-Live, the Gemini cascade, and `VOICE_PROVIDER=pipeline` pass that payload through. Gemini Live (`VOICE_PROVIDER=geminilive`) resamples it: 16 kHz PCM into the Live API, and 24 kHz PCM back to 8 kHz μ-law.
 
 The sales script is a placeholder. Compliance behaviour is already in place: a short identity check, then an AI disclosure and Tack45 identification before any pitch, an Australian accent instruction, calling-hours and do-not-call guards, and an opt-out tool.
 
@@ -10,10 +10,10 @@ No live Twilio or model calls are made by the tests. `scripts/place_call.py` is 
 
 1. `POST /calls` checks the bearer token, the do-not-call list, and the callee's local calling window, then creates a Twilio call. The realtime provider is not contacted while the phone is ringing.
 2. Twilio dials `TWILIO_FROM_NUMBER` (intended to be `+61290904464`) with `MachineDetection=DetectMessageEnd` and async AMD.
-3. On answer, the voice webhook returns `<Connect><Stream>` immediately. It does not pause for AMD. The realtime session is opened at that moment, the session config is sent straight away, and the short opener is spoken without waiting for `AnsweredBy`.
+3. On answer, the voice webhook returns `<Connect><Stream>` immediately. It does not pause for AMD. The realtime session is opened at that moment, the session config is sent straight away, and the short opener is spoken without waiting for `AnsweredBy`. `VOICE_PROVIDER=pipeline` still opens the stream then, and holds only the outbound opener until the callee has said hello.
 4. Human, or AMD still pending: the media WebSocket is already up. A later human result is stored and the stream is left as it is.
 5. Machine: hang up, or play `MACHINE_MESSAGE` and then hang up. No voicemail is left unless `MACHINE_MESSAGE` is set. Fax hangs up. `unknown` and any other unrecognised result stay on the line. Each result is stored.
-6. Grok, OpenAI, and GPT-Live forward μ-law payloads unchanged. Gemini Live resamples each frame. Barge-in sends Twilio `clear` and drops audio still queued here. `end_call` hangs up via the Twilio REST API after the current audio finishes.
+6. Grok, OpenAI, GPT-Live, the Gemini cascade, and the Cloud pipeline forward μ-law payloads unchanged. Gemini Live resamples each frame. Barge-in sends Twilio `clear` and drops audio still queued here. `end_call` hangs up via the Twilio REST API after the current audio finishes.
 
 ```
 phone  <->  Twilio Media Streams (audio/pcmu, 8 kHz)
@@ -25,6 +25,8 @@ phone  <->  Twilio Media Streams (audio/pcmu, 8 kHz)
                              (VOICE_PROVIDER=gemini, still μ-law 8 kHz)
                         <->  Gemini Live  (VOICE_PROVIDER=geminilive)
                              8 kHz μ-law <-> 16 kHz PCM in / 24 kHz PCM out
+                        <->  Cloud Speech-to-Text + Gemini text + Cloud TTS
+                             (VOICE_PROVIDER=pipeline, μ-law 8 kHz throughout)
 ```
 
 ## Run locally
@@ -94,7 +96,7 @@ Area codes `02`, `03`, and `07` select Sydney, Melbourne, and Brisbane. Mobiles 
 
 ## Voice providers
 
-`VOICE_PROVIDER=grok` (default), `openai`, `gptlive`, `gemini`, or `geminilive`.
+`VOICE_PROVIDER=grok` (default), `openai`, `gptlive`, `gemini`, `geminilive`, or `pipeline`.
 
 Grok and OpenAI Realtime both request `audio/pcmu` in and out, `server_vad`, and the tools `end_call` and `record_opt_out`. Grok also enables `grok-transcribe` on input and, unless `USE_FORCE_MESSAGE=false`, speaks the opener with xAI `force_message` (verbatim TTS, not a model-written line). OpenAI has no `force_message`; the opener is requested with `response.create` instructions. See the [xAI voice agent guide](https://docs.x.ai/docs/guides/voice/agent) and the [phone cookbook](https://docs.x.ai/cookbook/examples/voice-agent-phone).
 
@@ -203,6 +205,48 @@ Use your own mobile, not a guessed number. Codec and tool behaviour without a so
 python -m pytest tests/test_pcm_bridge.py tests/test_gemini_live.py
 ```
 
+### Cascaded Cloud pipeline
+
+`VOICE_PROVIDER=pipeline` is a separate cascaded path. Grok stays the default. Geminilive and GPT-Live are not modified, and neither of them becomes the default. The pipeline runs only when `VOICE_PROVIDER=pipeline`.
+
+Audio stays 8 kHz G.711 μ-law from Twilio, through speech recognition, and back out. Nothing is resampled.
+
+* Listener: Google Cloud Speech-to-Text v2 streaming on the implicit recognizer `projects/{project}/locations/{location}/recognizers/_`. The default model is `telephony` in `global`, language `en-AU`, encoding MULAW, 8 kHz, one channel. Interim results and voice-activity events are on. `speech_end_timeout` defaults to 500 ms (`PIPELINE_STT_ENDPOINT_MS`). `speech_start_timeout` is left unset; setting it drops the stream during silence. `en-AU` telephony is available in `global`, `eu`, and `us`. `chirp_3` needs `us` or `eu`. Override with `PIPELINE_STT_MODEL` and `PIPELINE_STT_LOCATION` if you move off telephony.
+* Reply: one streaming `generateContent` request per caller turn, model `PIPELINE_LLM_MODEL` (default `gemini-2.5-flash`), using `GEMINI_API_KEY`. The system prompt, the call brief, the AI disclosure, opt-out, off-topic refusal, and `end_call` are the same text the other providers get. The first clause is flushed to speech as soon as it is a sentence, a comma clause of at least three words, or twelve words.
+* Speaker: Cloud Text-to-Speech gRPC `StreamingSynthesize`. Voice `PIPELINE_TTS_VOICE` (default `en-AU-Chirp3-HD-Charon`), language `en-AU`, MULAW, 8 kHz, sent straight to Twilio in 20 ms frames. One stream per utterance. There is no Gemini TTS request, so the Flash-Lite 10 requests/minute and 100/day cap does not apply.
+
+Barge-in stops synthesis and sends Twilio `clear`, except while the opener is protected. On an outbound call the opener waits for the person called to speak and then be quiet, using the same settings as the opener-wait change: `OPENER_WAIT_FOR_SPEECH` (default true), `OPENER_SILENCE_MS` (default 500), `OPENER_MAX_WAIT_MS` (default 2500). The hello is not forwarded to speech recognition, so it cannot start a second reply. The log line is either `Opener triggered by speech after N ms` or `Opener triggered by the timeout after N ms`. Inbound calls do not wait. Those settings do not change Grok, OpenAI, GPT-Live, or Gemini Live in this build.
+
+Each caller turn logs one line, with no transcript and no credentials: `Pipeline turn latency call=<id> stt_final_ms=<n> llm_token_ms=<n> tts_audio_ms=<n>`. The clock starts at speech-activity end. A missing sample is `-`.
+
+Calling hours, the do-not-call list, call records, and the finished-call webhook are the same code as the other providers. A 429 from the text model plays "Sorry, I'm having trouble on my side. I'll leave it there. Goodbye." and hangs up. Opt-out is written when `record_opt_out` arrives, before the goodbye finishes.
+
+`GEMINI_API_KEY` is an AI Studio key. It is not the service account. Speech-to-Text and Text-to-Speech use `GOOGLE_TTS_CREDENTIALS_JSON`, the same service-account JSON as the Cloud TTS probe. `GOOGLE_CLOUD_CREDENTIALS_JSON` is used only when that value is empty. The JSON and the access token are not logged. The probe still ignores `GOOGLE_CLOUD_CREDENTIALS_JSON`.
+
+Google no longer publishes a fixed rate-limit table for the Gemini API (the pricing and limits pages were last refreshed 15 October 2026). Check the key's limits in AI Studio before a campaign. Each caller turn is one `generateContent` request. An earlier published Tier 1 figure for `gemini-2.5-flash` was about 1,000 requests per minute and 10,000 per day, with a spend cap around $10 per 10 minutes. The free tier was about 10 requests per minute and 250 per day. A key still on the free tier will end calls as soon as a turn is refused.
+
+Setup on the Google Cloud project that owns the service account:
+
+1. Enable `speech.googleapis.com` and `texttospeech.googleapis.com`.
+2. Grant the service account `roles/speech.client` (Cloud Speech Client). That includes `speech.recognizers.recognize`, which is what the implicit `_` recognizer calls. Do not grant `roles/speech.serviceAgent` to this key; that role is for Google's own service agent.
+3. Short-audio Cloud TTS synthesize is authorized by the `cloud-platform` OAuth scope on the service-account token. There is no separate IAM role for that short synthesize call (`roles/texttospeech.editor` covers long-audio operations only). Enabling the Text-to-Speech API and using this key is the path Google documents. An organisation policy can still require a project role; if synthesize returns 403, add a project role that the policy lists for Text-to-Speech.
+4. The JSON key must include `project_id`, `client_email`, `private_key`, and `token_uri`. `project_id` is the recognizer path. It is read from the JSON and not written to the log by this service.
+
+```bash
+VOICE_PROVIDER=pipeline GEMINI_API_KEY=... GOOGLE_TTS_CREDENTIALS_JSON='{"type":"service_account",...}' \
+CALLER_BASE_URL=http://127.0.0.1:8787 API_BEARER_TOKEN=your-token \
+  python scripts/place_call.py \
+  --to +61412345678 \
+  --name "Sam Lee" \
+  --business "Harbour Roasters"
+```
+
+Use your own mobile, not a guessed number. Behaviour without Google:
+
+```bash
+python -m pytest tests/test_pipeline.py
+```
+
 ## Storage
 
 SQLite at `SQLITE_PATH` (default `data/calls.db`) unless `DATABASE_URL` is set. A Railway `postgres://` URL is rewritten for asyncpg, and `sslmode=require` becomes an SSL connection.
@@ -221,7 +265,7 @@ When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The 
 | `TWILIO_API_KEY_SID` | yes | API key sid (`SK...`), used as HTTP basic auth username |
 | `TWILIO_API_KEY_SECRET` | yes | API key secret |
 | `TWILIO_FROM_NUMBER` | yes | Caller ID. Use `+61290904464` |
-| `VOICE_PROVIDER` | yes | `grok` (default), `openai`, `gptlive`, `gemini`, or `geminilive` |
+| `VOICE_PROVIDER` | yes | `grok` (default), `openai`, `gptlive`, `gemini`, `geminilive`, or `pipeline` |
 | `XAI_API_KEY` | when provider is grok | xAI key for `wss://api.x.ai/v1/realtime` |
 | `OPENAI_API_KEY` | when provider is openai or gptlive | OpenAI key for Realtime or GPT-Live |
 | `TWILIO_AUTH_TOKEN` | no | When set, webhooks must carry a valid `X-Twilio-Signature` |
@@ -246,6 +290,9 @@ When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The 
 | `DEFAULT_TIMEZONE` | no | Default `Australia/Sydney` |
 | `PROMPT_PATH` | no | Default `prompts/system.txt` |
 | `OPENER_PATH` | no | Default `prompts/compliance_opener.txt` |
+| `OPENER_WAIT_FOR_SPEECH` | no | Default `true`. `VOICE_PROVIDER=pipeline` waits for the outbound callee to speak, then a short silence. Inbound does not wait. Other providers ignore it in this build |
+| `OPENER_SILENCE_MS` | no | Quiet time after that speech before the pipeline opener. Default 500 |
+| `OPENER_MAX_WAIT_MS` | no | Pipeline plays the opener if nobody speaks. Default 2500, from when the stream starts |
 | `INBOUND_PROMPT_PATH` | no | Default `prompts/inbound_system.txt` |
 | `INBOUND_LOOKUP_DAYS` | no | Match a caller to an outbound call from the last N days. Default 90. `0` keeps all |
 | `MACHINE_MESSAGE` | no | Empty hangs up on machines. Otherwise spoken, then hangup |
@@ -253,9 +300,16 @@ When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The 
 | `MACHINE_DETECTION_TIMEOUT` | no | Twilio `MachineDetectionTimeout`. Default 30 |
 | `HANGUP_GRACE_SECONDS` | no | Extra wait after playback before the hangup watchdog. Default 8 |
 | `LOG_LEVEL` | no | Default `INFO` |
-| `GEMINI_API_KEY` | when provider is gemini or geminilive | Cascade text and TTS, Gemini Live, and `POST /probe/tts`. Grok, OpenAI, and GPT-Live do not read it |
-| `GOOGLE_TTS_CREDENTIALS_JSON` | no | Admin `POST /probe/tts` with `provider: "cloudtts"`. Full service-account JSON. Calls do not use it, and it is not logged |
-| `GOOGLE_TTS_API_KEY` | no | Fallback for that probe only when `GOOGLE_TTS_CREDENTIALS_JSON` is empty. Chirp 3 HD rejects API keys |
+| `GEMINI_API_KEY` | when provider is gemini, geminilive, or pipeline | Cascade text and TTS, Gemini Live, the pipeline text model, and `POST /probe/tts`. Grok, OpenAI, and GPT-Live do not read it |
+| `GOOGLE_TTS_CREDENTIALS_JSON` | when provider is pipeline | Full service-account JSON for the Cloud TTS probe and for `VOICE_PROVIDER=pipeline` (Speech-to-Text and StreamingSynthesize). Not logged |
+| `GOOGLE_CLOUD_CREDENTIALS_JSON` | no | Same JSON, used by the pipeline only when `GOOGLE_TTS_CREDENTIALS_JSON` is empty. The probe does not read it |
+| `GOOGLE_TTS_API_KEY` | no | Fallback for the Cloud TTS probe only when `GOOGLE_TTS_CREDENTIALS_JSON` is empty. Chirp 3 HD rejects API keys. The pipeline does not use it |
+| `PIPELINE_LLM_MODEL` | no | Pipeline text model. Default `gemini-2.5-flash`. One streaming request per caller turn. Check that key's limits in AI Studio |
+| `PIPELINE_TTS_VOICE` | no | Cloud TTS voice. Default `en-AU-Chirp3-HD-Charon` |
+| `PIPELINE_STT_MODEL` | no | Speech-to-Text v2 model. Default `telephony` |
+| `PIPELINE_STT_LANGUAGE` | no | Default `en-AU` |
+| `PIPELINE_STT_LOCATION` | no | Recognizer location. Default `global`. Use `us` or `eu` for `chirp_3` |
+| `PIPELINE_STT_ENDPOINT_MS` | no | Silence after the caller stops before the final transcript. Default 500 |
 | `DEEPGRAM_API_KEY` | when provider is gemini | Streaming speech-to-text for the cascade. Gemini Live does not use it |
 | `DEEPGRAM_URL` | no | Default `wss://api.deepgram.com/v1/listen` |
 | `DEEPGRAM_MODEL` | no | Default `nova-3` |
@@ -306,7 +360,7 @@ Set `TWILIO_AUTH_TOKEN` (the account auth token, not the API key) if you want we
 
 ## TTS latency probe
 
-`POST /probe/tts` is an admin check for speech latency. It uses the same bearer token as `/calls` and does not dial or open a voice session. `provider` is `gemini` (the default) or `cloudtts`. `GEMINI_API_KEY` is optional; without it a Gemini probe returns 503 and startup is unchanged. `GOOGLE_TTS_CREDENTIALS_JSON` is optional; without it, and without `GOOGLE_TTS_API_KEY`, a Cloud TTS probe returns 400 and startup is unchanged. Calls never read either value. The service-account JSON and the access token minted from it are not logged.
+`POST /probe/tts` is an admin check for speech latency. It uses the same bearer token as `/calls` and does not dial or open a voice session. `provider` is `gemini` (the default) or `cloudtts`. `GEMINI_API_KEY` is optional; without it a Gemini probe returns 503 and startup is unchanged. `GOOGLE_TTS_CREDENTIALS_JSON` is optional; without it, and without `GOOGLE_TTS_API_KEY`, a Cloud TTS probe returns 400 and startup is unchanged. Grok, OpenAI, GPT-Live, the Gemini cascade, and Gemini Live do not read the service-account JSON. `VOICE_PROVIDER=pipeline` does. The probe does not read `GOOGLE_CLOUD_CREDENTIALS_JSON`. The service-account JSON and the access token minted from it are not logged.
 
 The body may set `sentences`, `runs_per_sentence` (default 1), `style`, `voice`, `model`, `save_samples` (default 3), and `streaming` (default false). Omitted sentences are about twenty short Tack45 lines. A Gemini probe calls `gemini-3.8-flash-lite-tts` on the Interactions API with `stream: true`, μ-law at 8 kHz, and the style `Australian English accent, relaxed and friendly` unless overridden. The voice goes in `generation_config.speech_config` and defaults to `Kore`. The result records `method: "interactions"`. `streaming: true` is rejected for Gemini.
 

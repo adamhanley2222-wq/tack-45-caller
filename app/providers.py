@@ -312,6 +312,11 @@ def build_session_plan(settings: Settings, instructions: str, opener: str) -> Se
             setup_messages=[gemini_live_setup(settings, instructions)],
             provider=provider,
         )
+    if provider == "pipeline":
+        return SessionPlan(
+            setup_messages=[_voice_pipeline(settings, instructions, opener)],
+            provider=provider,
+        )
     raise ValueError(f"Unsupported VOICE_PROVIDER: {settings.voice_provider}")
 
 
@@ -325,6 +330,32 @@ _GEMINI_TURN_POLICY = (
     "Do not say \"Australian English accent\" or describe how you sound.\n"
     "Call record_opt_out and end_call as tools. Never speak a tool name.\n"
 )
+
+
+def _voice_pipeline(settings: Settings, instructions: str, opener: str) -> dict:
+    """Local plan for STT, a text model, and Cloud TTS. Not a realtime socket."""
+    return {
+        "type": "voice.pipeline",
+        "instructions": instructions + _GEMINI_TURN_POLICY,
+        "opener": opener,
+        "tools": ["end_call", "record_opt_out"],
+        "llm": {"model": settings.pipeline_llm_model},
+        "tts": {
+            "provider": "cloudtts",
+            "voice": settings.pipeline_tts_voice,
+            "language": "en-AU",
+            "audio_encoding": "MULAW",
+            "sample_rate_hertz": 8000,
+        },
+        "stt": {
+            "provider": "google",
+            "model": settings.pipeline_stt_model,
+            "language": settings.pipeline_stt_language,
+            "location": settings.pipeline_stt_location,
+            "encoding": "MULAW",
+            "sample_rate_hertz": 8000,
+        },
+    }
 
 
 def _gemini_cascade(settings: Settings, instructions: str, opener: str) -> dict:
@@ -525,6 +556,10 @@ def provider_connection_target(settings: Settings) -> tuple[str, dict[str, str]]
     if provider == "gemini":
         raise ValueError(
             "VOICE_PROVIDER=gemini uses the cascaded pipeline, not a realtime websocket."
+        )
+    if provider == "pipeline":
+        raise ValueError(
+            "VOICE_PROVIDER=pipeline uses the cascaded pipeline, not a realtime websocket."
         )
     if provider == "geminilive":
         from app.gemini_live import gemini_live_ws_url
