@@ -162,6 +162,11 @@ def test_caller_audio_is_16k_pcm_only_after_the_opener_and_grok_stays_mulaw():
     )
     assert ready.provider_voice == "Charon"
     assert ready.provider_session_id == "models/gemini-3.8-live"
+    identified = _controller()
+    _start(identified)
+    with_id = identified.on_provider({"setupComplete": {"sessionId": "sess-from-gemini"}})
+    assert with_id.provider_session_id == "sess-from-gemini"
+    assert with_id.provider_voice == "Charon"
     during = relay.on_twilio(
         {"event": "media", "media": {"track": "inbound", "payload": base64.b64encode(b"\xff" * 160).decode()}}
     )
