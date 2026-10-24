@@ -72,6 +72,33 @@ class PcmBridge:
         return audioop.lin2ulaw(pcm8, _PCM_WIDTH)
 
 
+def linear16_to_mulaw8k(pcm: bytes, rate: int) -> bytes:
+    """Headerless little-endian 16-bit PCM to 8 kHz μ-law.
+
+    The TTS probe uses this when Cloud TTS returns LINEAR16. Call audio does
+    not. ``rate`` is the PCM sample rate.
+    """
+    if rate <= 0:
+        raise ValueError("pcm sample rate must be positive")
+    if len(pcm) % _PCM_WIDTH:
+        pcm = pcm[: len(pcm) - (len(pcm) % _PCM_WIDTH)]
+    if not pcm:
+        return b""
+    native = _to_native(pcm)
+    if rate != 8000:
+        native, _state = audioop.ratecv(native, _PCM_WIDTH, 1, rate, 8000, None)
+    if not native:
+        return b""
+    return audioop.lin2ulaw(native, _PCM_WIDTH)
+
+
+def mulaw_to_8k(payload: bytes, rate: int) -> bytes:
+    """μ-law at ``rate`` to 8 kHz μ-law. 8 kHz input is returned unchanged."""
+    if rate == 8000:
+        return payload
+    return linear16_to_mulaw8k(audioop.ulaw2lin(payload, _PCM_WIDTH), rate)
+
+
 def _to_native(pcm: bytes) -> bytes:
     if sys.byteorder == "little":
         return pcm

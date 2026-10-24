@@ -1,7 +1,9 @@
-"""Admin-only Gemini TTS latency probe.
+"""Admin-only TTS latency probe.
 
-This does not dial, open a voice session, or change call configuration.
-Audio is requested as 8 kHz G.711 μ-law, the same codec Twilio media uses.
+Gemini Flash-Lite is the default. ``provider: "cloudtts"`` measures Google
+Cloud Text-to-Speech Chirp 3 HD instead. This does not dial, open a voice
+session, or change call configuration. Audio is 8 kHz G.711 μ-law, the same
+codec Twilio media uses.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from fastapi.responses import Response
 
 from app.api import APIError, require_bearer
 from app.config import Settings
+from app.pcm_bridge import linear16_to_mulaw8k, mulaw_to_8k
 
 logger = logging.getLogger("tack45.tts_probe")
 
@@ -31,6 +34,11 @@ DEFAULT_MODEL = "gemini-3.8-flash-lite-tts"
 DEFAULT_STYLE = "Australian English accent, relaxed and friendly"
 DEFAULT_VOICE = "Kore"
 SAMPLE_RATE = 8000
+CLOUD_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
+CLOUD_TTS_METHOD = "text:synthesize"
+CLOUD_TTS_VOICE = "en-AU-Chirp3-HD-Charon"
+CLOUD_TTS_LANGUAGE = "en-AU"
+GEMINI_METHOD = "interactions"
 MAX_SENTENCES = 40
 MAX_RUNS = 5
 MAX_SAMPLES = 10
@@ -265,6 +273,73 @@ def _clips(app) -> list[dict[str, Any]]:
     return clips
 
 
+def cloudtts_body(text: str, voice: str) -> dict[str, Any]:
+    """Unary Cloud TTS request. Chirp 3 HD, μ-law at 8 kHz, language en-AU."""
+    return {
+        "input": {"text": text},
+        "voice": {"languageCode": CLOUD_TTS_LANGUAGE, "name": voice},
+        "audioConfig": {"audioEncoding": "MULAW", "sampleRateHertz": SAMPLE_RATE},
+    }
+
+
+def _wav_format_and_data(payload: bytes) -> tuple[int, int, int, bytes] | None:
+    """Return format code, sample rate, bits, and the data chunk. None if this is not WAV."""
+    if len(payload) < 12 or payload[:4] != b"RIFF" or payload[8:12] != b"WAVE":
+        return None
+    offset = 12
+    audio_format = rate = bits = None
+    data = None
+    while offset + 8 <= len(payload):
+        chunk_id = payload[offset : offset + 4]
+        size = struct.unpack_from("<I", payload, offset + 4)[0]
+        body = payload[offset + 8 : offset + 8 + size]
+        if chunk_id == b"fmt " and len(body) >= 16:
+            audio_format, _channels, rate, _byte_rate, _block, bits = struct.unpack_from("<HHIIHH", body, 0)
+        elif chunk_id == b"data":
+            data = body
+        offset += 8 + size + (size % 2)
+    if audio_format is None or rate is None or bits is None or data is None:
+        return None
+    return audio_format, rate, bits, data
+
+
+def mulaw_from_cloud_audio(
+    payload: bytes,
+    clock: Callable[[], float],
+) -> tuple[bytes, float, str | None]:
+    """Raw 8 kHz μ-law, conversion milliseconds, and an error.
+
+    Cloud TTS wraps MULAW and LINEAR16 in a WAV header. A headerless body is
+    treated as μ-law already. LINEAR16 is converted here, and only that work
+    is on the clock.
+    """
+    parsed = _wav_format_and_data(payload)
+    if parsed is None:
+        return payload, 0.0, None
+    audio_format, rate, bits, data = parsed
+    if audio_format == 7 and rate == SAMPLE_RATE:
+        return data, 0.0, None
+    if audio_format not in {1, 7} or (audio_format == 1 and bits != 16):
+        return b"", 0.0, f"Cloud TTS audio format {audio_format} at {rate} Hz is not μ-law or 16-bit PCM."
+    started = clock()
+    if audio_format == 7:
+        mulaw = mulaw_to_8k(data, rate)
+    else:
+        mulaw = linear16_to_mulaw8k(data, rate)
+    return mulaw, (clock() - started) * 1000, None
+
+
+def _now() -> float:
+    """Indirection so tests can replace the clock without touching time.monotonic."""
+    return time.monotonic()
+
+
+def _redact(text: str, secret: str) -> str:
+    if secret:
+        text = text.replace(secret, "[redacted]")
+    return text[:500]
+
+
 def _parse_probe_body(payload: Any) -> dict[str, Any]:
     if payload is None:
         payload = {}
@@ -283,10 +358,14 @@ def _parse_probe_body(payload: Any) -> dict[str, Any]:
             if not isinstance(item, str) or not item.strip():
                 raise APIError(422, "invalid_body", "Each sentence must be a non-empty string.")
             chosen.append(item.strip())
+    provider = payload.get("provider", "gemini")
+    if not isinstance(provider, str) or provider not in {"gemini", "cloudtts"}:
+        raise APIError(422, "invalid_body", 'provider must be "gemini" or "cloudtts".')
     runs = payload.get("runs_per_sentence", 1)
     samples = payload.get("save_samples", 3)
     style = payload.get("style", DEFAULT_STYLE)
-    voice = payload.get("voice", DEFAULT_VOICE)
+    voice_default = CLOUD_TTS_VOICE if provider == "cloudtts" else DEFAULT_VOICE
+    voice = payload.get("voice", voice_default)
     model = payload.get("model", DEFAULT_MODEL)
     if isinstance(runs, bool) or not isinstance(runs, int) or runs < 1 or runs > MAX_RUNS:
         raise APIError(422, "invalid_body", f"runs_per_sentence must be an integer from 1 to {MAX_RUNS}.")
@@ -299,6 +378,7 @@ def _parse_probe_body(payload: Any) -> dict[str, Any]:
     if not isinstance(model, str) or not model.strip():
         raise APIError(422, "invalid_body", "model must be a non-empty string.")
     return {
+        "provider": provider,
         "sentences": chosen,
         "runs_per_sentence": runs,
         "save_samples": samples,
@@ -355,8 +435,101 @@ async def synthesize(
     return {
         "ttfa_ms": ttfa_ms,
         "total_ms": (end - start) * 1000,
+        "conversion_ms": 0.0,
         "audio": audio,
         "error": error,
+    }
+
+
+async def synthesize_cloudtts(
+    api_key: str,
+    body: dict[str, Any],
+    *,
+    clock: Callable[[], float] | None = None,
+) -> dict[str, Any]:
+    """POST one unary text:synthesize. The clock is read immediately before send.
+
+    StreamingSynthesize is not used: it is a bidirectional gRPC method whose
+    documented auth is an OAuth token, and it is not in the REST discovery
+    document. The key is sent as a header so it is not written into the URL.
+    """
+    tick = clock or _now
+    start = tick()
+    conversion_ms = 0.0
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                CLOUD_TTS_URL,
+                headers={
+                    "X-Goog-Api-Key": api_key,
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+    except httpx.HTTPError as exc:
+        end = tick()
+        return {
+            "ttfa_ms": None,
+            "total_ms": (end - start) * 1000,
+            "conversion_ms": 0.0,
+            "audio": b"",
+            "error": _redact(str(exc), api_key),
+        }
+    if response.status_code >= 400:
+        raw = _redact(response.text, api_key)
+        end = tick()
+        return {
+            "ttfa_ms": None,
+            "total_ms": (end - start) * 1000,
+            "conversion_ms": 0.0,
+            "audio": b"",
+            "error": f"HTTP {response.status_code}: {raw}",
+        }
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        end = tick()
+        return {
+            "ttfa_ms": None,
+            "total_ms": (end - start) * 1000,
+            "conversion_ms": 0.0,
+            "audio": b"",
+            "error": "Cloud TTS response was not JSON.",
+        }
+    encoded = payload.get("audioContent") if isinstance(payload, dict) else None
+    if not isinstance(encoded, str) or not encoded:
+        end = tick()
+        return {
+            "ttfa_ms": None,
+            "total_ms": (end - start) * 1000,
+            "conversion_ms": 0.0,
+            "audio": b"",
+            "error": "Cloud TTS response contained no audio.",
+        }
+    try:
+        raw_audio = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+        end = tick()
+        return {
+            "ttfa_ms": None,
+            "total_ms": (end - start) * 1000,
+            "conversion_ms": 0.0,
+            "audio": b"",
+            "error": "Cloud TTS audioContent was not base64.",
+        }
+    first = tick()
+    audio, conversion_ms, convert_error = mulaw_from_cloud_audio(raw_audio, tick)
+    end = tick()
+    if convert_error:
+        audio = b""
+    elif not audio:
+        convert_error = "Cloud TTS response contained no audio."
+    return {
+        "ttfa_ms": None if convert_error else (first - start) * 1000,
+        "total_ms": (end - start) * 1000,
+        "conversion_ms": conversion_ms,
+        "audio": audio,
+        "error": convert_error,
     }
 
 
@@ -364,8 +537,6 @@ async def synthesize(
 async def probe_tts(request: Request) -> dict[str, Any]:
     require_bearer(request)
     settings: Settings = request.app.state.settings
-    if not settings.gemini_api_key:
-        raise APIError(503, "not_configured", "GEMINI_API_KEY not set")
     raw = await request.body()
     if not raw.strip():
         payload: Any = {}
@@ -375,6 +546,11 @@ async def probe_tts(request: Request) -> dict[str, Any]:
         except json.JSONDecodeError as exc:
             raise APIError(422, "invalid_body", "Body must be JSON.") from exc
     options = _parse_probe_body(payload)
+    if options["provider"] == "cloudtts":
+        if not settings.google_tts_api_key:
+            raise APIError(400, "not_configured", "GOOGLE_TTS_API_KEY not set")
+    elif not settings.gemini_api_key:
+        raise APIError(503, "not_configured", "GEMINI_API_KEY not set")
     rows: list[dict[str, Any]] = []
     ttfa_values: list[float] = []
     total_values: list[float] = []
@@ -382,17 +558,22 @@ async def probe_tts(request: Request) -> dict[str, Any]:
     for sentence in options["sentences"]:
         runs: list[dict[str, Any]] = []
         for _ in range(options["runs_per_sentence"]):
-            body = interaction_body(
-                sentence,
-                model=options["model"],
-                style=options["style"],
-                voice=options["voice"],
-            )
-            result = await synthesize(settings.gemini_api_key, body)
+            if options["provider"] == "cloudtts":
+                body = cloudtts_body(sentence, options["voice"])
+                result = await synthesize_cloudtts(settings.google_tts_api_key, body)
+            else:
+                body = interaction_body(
+                    sentence,
+                    model=options["model"],
+                    style=options["style"],
+                    voice=options["voice"],
+                )
+                result = await synthesize(settings.gemini_api_key, body)
             audio: bytes = result["audio"]
             row = {
                 "ttfa_ms": result["ttfa_ms"],
                 "total_ms": result["total_ms"],
+                "conversion_ms": result.get("conversion_ms", 0.0),
                 "audio_bytes": len(audio),
                 "audio_seconds": len(audio) / SAMPLE_RATE,
                 "error": result["error"],
@@ -405,9 +586,9 @@ async def probe_tts(request: Request) -> dict[str, Any]:
                 clips.append({"sentence": sentence, "audio": audio})
         rows.append({"sentence": sentence, "runs": runs})
     request.app.state.tts_probe_clips = clips
-    return {
-        "model": options["model"],
-        "style": options["style"],
+    reported = {
+        "provider": options["provider"],
+        "method": CLOUD_TTS_METHOD if options["provider"] == "cloudtts" else GEMINI_METHOD,
         "voice": options["voice"],
         "mime_type": "audio/mulaw",
         "sample_rate": SAMPLE_RATE,
@@ -424,6 +605,12 @@ async def probe_tts(request: Request) -> dict[str, Any]:
             for index, clip in enumerate(clips)
         ],
     }
+    if options["provider"] == "cloudtts":
+        reported["language_code"] = CLOUD_TTS_LANGUAGE
+    else:
+        reported["model"] = options["model"]
+        reported["style"] = options["style"]
+    return reported
 
 
 @router.get("/probe/tts/sample/{n}.wav")
