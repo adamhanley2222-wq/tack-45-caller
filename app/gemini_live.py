@@ -142,7 +142,13 @@ def gemini_live_events(message: dict, bridge: PcmBridge) -> list[NormalizedEvent
     if not isinstance(message, dict):
         return []
     if "setupComplete" in message or "setup_complete" in message:
-        return [NormalizedEvent("session_started")]
+        complete = message.get("setupComplete")
+        if not isinstance(complete, dict):
+            complete = message.get("setup_complete")
+        session_id = ""
+        if isinstance(complete, dict):
+            session_id = str(complete.get("sessionId") or complete.get("session_id") or "")
+        return [NormalizedEvent("session_started", item_id=session_id or None)]
     tool_call = message.get("toolCall") or message.get("tool_call")
     if isinstance(tool_call, dict):
         return _tool_events(tool_call)

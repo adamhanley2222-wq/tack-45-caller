@@ -184,6 +184,8 @@ A single pass over a 3 minute call is about 1.5 cents of caller audio plus about
 
 `GEMINI_API_KEY` is required. `DEEPGRAM_API_KEY` is not. Grok still does not read the Gemini key.
 
+Gemini sends `setupComplete` and audio as binary WebSocket frames whose payload is UTF-8 JSON. The Live socket decodes those frames. Grok, OpenAI, and GPT-Live still ignore unexpected binary frames.
+
 One real call, only when you mean to dial, to a number you control, during calling hours. Do not change the Twilio number.
 
 ```bash
@@ -207,7 +209,7 @@ SQLite at `SQLITE_PATH` (default `data/calls.db`) unless `DATABASE_URL` is set. 
 
 Each call row stores `direction` (`outbound` or `inbound`), `call_sid`, both numbers, AMD result, provider, timestamps, duration, end reason, opt-out, and a transcript with `assistant` and `caller` lines.
 
-When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The body is the call id, sid, direction, both numbers, name, business, notes, provider, status, AMD result, end reason, opt-out, duration, timestamps, and the transcript. Delivery waits until the media stream has closed, runs in the background with a 10 second timeout, and retries up to three times. A delivery failure is logged and does not affect the call. `TRANSCRIPT_WEBHOOK_SECRET` is optional. With the default `TRANSCRIPT_WEBHOOK_AUTH_HEADER=Authorization` it is sent as `Bearer <secret>`; any other header name sends the raw secret.
+When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The body is the call id, sid, direction, both numbers, name, business, notes, provider, status, AMD result, end reason, opt-out, duration, timestamps, and the transcript. Delivery waits until the media stream has closed, runs in the background with a 10 second timeout, and retries up to three times. A delivery failure is logged and does not affect the call. `TRANSCRIPT_WEBHOOK_SECRET` is optional. With the default `TRANSCRIPT_WEBHOOK_AUTH_HEADER=Authorization` it is sent as `Bearer <secret>`; any other header name sends the raw secret. A full header line is also accepted (`Authorization: Bearer <token>`, or `X-Webhook-Token: <token>`). The name is the text before the first colon. The whole line is not used as the header name.
 
 ## Environment variables
 
@@ -270,7 +272,7 @@ When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The 
 | `GEMINILIVE_STYLE` | no | System instruction only. Default `Australian English accent, relaxed and friendly` |
 | `TRANSCRIPT_WEBHOOK_URL` | no | Where to POST each finished call. Empty disables the feature |
 | `TRANSCRIPT_WEBHOOK_SECRET` | no | Secret sent with that POST. Empty sends no auth header |
-| `TRANSCRIPT_WEBHOOK_AUTH_HEADER` | no | Header name for the secret. Default `Authorization`, which sends `Bearer <secret>`. Any other name sends the raw secret |
+| `TRANSCRIPT_WEBHOOK_AUTH_HEADER` | no | Header name, or a full `Name: value` line. Default `Authorization`, which sends `Bearer <secret>`. Any other name sends the raw secret |
 
 The service boots and serves `/health` without these. `POST /calls` returns 503 until the dial settings for the selected provider are present.
 

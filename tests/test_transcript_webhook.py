@@ -117,6 +117,27 @@ def test_auth_header_is_bearer_only_for_authorization():
         transcript_webhook_auth_header="X-Webhook-Token",
     )
     assert webhook_headers(unnamed) == {}
+    pasted = Settings(
+        _env_file=None,
+        transcript_webhook_url="https://hooks.example/calls",
+        transcript_webhook_secret="ignored-because-the-line-has-a-value",
+        transcript_webhook_auth_header="Authorization: Bearer pasted-token",
+    )
+    assert webhook_headers(pasted) == {"Authorization": "Bearer pasted-token"}
+    # The Railway failure used the whole line as the header name.
+    assert ":" not in next(iter(webhook_headers(pasted)))
+    scheme_only = Settings(
+        _env_file=None,
+        transcript_webhook_secret="topsecret",
+        transcript_webhook_auth_header="Authorization: Bearer",
+    )
+    assert webhook_headers(scheme_only) == {"Authorization": "Bearer topsecret"}
+    custom_line = Settings(
+        _env_file=None,
+        transcript_webhook_secret="topsecret",
+        transcript_webhook_auth_header="X-Webhook-Token: line-secret",
+    )
+    assert webhook_headers(custom_line) == {"X-Webhook-Token": "line-secret"}
     assert len(RETRY_DELAYS_SECONDS) == 3
     assert WEBHOOK_TIMEOUT_SECONDS == 10
 

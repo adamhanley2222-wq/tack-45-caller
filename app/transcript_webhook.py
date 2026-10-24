@@ -26,16 +26,40 @@ WEBHOOK_TIMEOUT_SECONDS = 10.0
 
 
 def webhook_headers(settings: Settings) -> dict[str, str]:
-    """Auth header for the transcript webhook. Empty when no secret is set."""
-    secret = settings.transcript_webhook_secret or ""
-    if not secret:
+    """Auth header for the transcript webhook.
+
+    ``TRANSCRIPT_WEBHOOK_AUTH_HEADER`` is a header name. ``Authorization``
+    sends ``Bearer <secret>``. Any other name sends the secret as the value.
+
+    A full header line is accepted too (``Authorization: Bearer <token>``).
+    The text before the first colon is the name and the rest is the value.
+    Using that whole line as the name makes httpx reject the request.
+    """
+    secret = (settings.transcript_webhook_secret or "").strip()
+    raw = (settings.transcript_webhook_auth_header or "").strip()
+    if not raw:
         return {}
-    name = (settings.transcript_webhook_auth_header or "").strip()
+    name, inline = _split_header_line(raw)
     if not name:
+        return {}
+    if inline:
+        if name.lower() == "authorization" and inline.lower() == "bearer":
+            if not secret:
+                return {}
+            return {name: f"Bearer {secret}"}
+        return {name: inline}
+    if not secret:
         return {}
     if name.lower() == "authorization":
         return {name: f"Bearer {secret}"}
     return {name: secret}
+
+
+def _split_header_line(raw: str) -> tuple[str, str]:
+    if ":" not in raw:
+        return raw.strip(), ""
+    name, value = raw.split(":", 1)
+    return name.strip(), value.strip()
 
 
 def _redact(message: str, secret: str) -> str:

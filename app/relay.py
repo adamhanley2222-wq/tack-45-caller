@@ -258,7 +258,8 @@ class RelayController:
 
     def _on_gemini_live_event(self, norm: NormalizedEvent) -> StepResult:
         if norm.kind == "session_started":
-            return self._on_session_started({})
+            event = {"session_id": norm.item_id} if norm.item_id else {}
+            return self._on_session_started(event)
         if norm.kind == "audio":
             if self.interrupted:
                 return self._on_audio(norm)
@@ -433,12 +434,18 @@ class RelayController:
                 voice, model = session_identity(self.plan.setup_messages[0])
             else:
                 voice, model = "", ""
-            logger.info("Gemini Live session ready model=%s voice=%s", model or "-", voice or "-")
+            server_id = str(event.get("session_id") or "")
+            logger.info(
+                "Gemini Live session ready model=%s voice=%s session=%s",
+                model or "-",
+                voice or "-",
+                server_id or "-",
+            )
             return StepResult(
                 provider_messages=[gemini_live_opener(self.opener)],
                 capture_provider_session=True,
                 provider_voice=voice or None,
-                provider_session_id=model or None,
+                provider_session_id=server_id or model or None,
             )
         messages = [live_append_audio(payload) for payload in self.held_audio]
         self.held_audio.clear()
