@@ -69,6 +69,9 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Optional. Used only by POST /probe/tts. Calls do not read it.
+    gemini_api_key: str = ""
+
     # Empty disables the finished-call webhook.
     transcript_webhook_url: str = ""
     transcript_webhook_secret: str = ""

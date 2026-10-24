@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 from app import __version__
 from app.api import APIError, router
+from app.tts_probe import router as probe_router
 from app.config import Settings
 from app.db import Database
 from app.prewarm import PrewarmPool
@@ -49,6 +50,7 @@ def create_app(
 
     app = FastAPI(title="tack45-caller", version=__version__, lifespan=lifespan)
     app.include_router(router)
+    app.include_router(probe_router)
 
     @app.exception_handler(APIError)
     async def on_api_error(_request: Request, exc: APIError) -> JSONResponse:

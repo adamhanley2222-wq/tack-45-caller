@@ -152,6 +152,7 @@ When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The 
 | `MACHINE_DETECTION_TIMEOUT` | no | Twilio `MachineDetectionTimeout`. Default 30 |
 | `HANGUP_GRACE_SECONDS` | no | Extra wait after playback before the hangup watchdog. Default 8 |
 | `LOG_LEVEL` | no | Default `INFO` |
+| `GEMINI_API_KEY` | no | Admin `POST /probe/tts` only. Calls do not use it |
 | `TRANSCRIPT_WEBHOOK_URL` | no | Where to POST each finished call. Empty disables the feature |
 | `TRANSCRIPT_WEBHOOK_SECRET` | no | Secret sent with that POST. Empty sends no auth header |
 | `TRANSCRIPT_WEBHOOK_AUTH_HEADER` | no | Header name for the secret. Default `Authorization`, which sends `Bearer <secret>`. Any other name sends the raw secret |
@@ -183,6 +184,14 @@ Outbound calls set their own answer, AMD, and status webhooks. Inbound calls use
    - `wss://{host}/streams/media/{token}` for media, starting on answer rather than after AMD
 
 Set `TWILIO_AUTH_TOKEN` (the account auth token, not the API key) if you want webhook signatures checked. Leave it unset in local development.
+
+## TTS latency probe
+
+`POST /probe/tts` is an admin check for Gemini Flash-Lite speech latency. It uses the same bearer token as `/calls` and does not dial or open a voice session. `GEMINI_API_KEY` is optional; without it the route returns 503 and startup is unchanged.
+
+The body may set `sentences`, `runs_per_sentence` (default 1), `style`, `voice`, `model`, and `save_samples` (default 3). Omitted sentences are about twenty short Tack45 lines. Each request is `gemini-3.8-flash-lite-tts` on the Interactions API with `stream: true`, μ-law at 8 kHz, and the style `Australian English accent, relaxed and friendly` unless overridden. The voice goes in `generation_config.speech_config` and defaults to `Kore`.
+
+The JSON reports time to first audio byte and total time for each run, p50/p90/min/max, audio bytes and seconds, and `RAILWAY_REPLICA_REGION` when that environment variable is set. Up to `save_samples` clips are returned as base64 μ-law and kept in memory for `GET /probe/tts/sample/{n}.wav`.
 
 ## Deploy on Railway
 
