@@ -1,4 +1,12 @@
-"""Realtime session setup for xAI Grok Voice, OpenAI Realtime, and GPT-Live.
+"""Realtime session setup for xAI Grok Voice, OpenAI Realtime, GPT-Live, and Gemini Live.
+
+``VOICE_PROVIDER=gemini`` does not open one of these sockets. It returns a
+local cascade plan (instructions plus the opener). The media route runs that
+plan through the Deepgram / Gemini pipeline instead of ``run_relay``.
+
+``VOICE_PROVIDER=geminilive`` does open a socket: the Gemini Live API. Twilio
+μ-law is resampled to 16 kHz PCM on the way in and from 24 kHz PCM on the way
+out. Grok, OpenAI, and GPT-Live still forward μ-law unchanged.
 
 Grok and OpenAI Realtime are configured for ``audio/pcmu`` (G.711 μ-law,
 8 kHz) with no sample-rate field: 8 kHz is the codec, and adding a PCM rate
@@ -292,7 +300,52 @@ def build_session_plan(settings: Settings, instructions: str, opener: str) -> Se
             setup_messages=[_gptlive_session(settings, instructions, opener)],
             provider=provider,
         )
+    if provider == "gemini":
+        return SessionPlan(
+            setup_messages=[_gemini_cascade(settings, instructions, opener)],
+            provider=provider,
+        )
+    if provider == "geminilive":
+        from app.gemini_live import gemini_live_setup
+
+        return SessionPlan(
+            setup_messages=[gemini_live_setup(settings, instructions)],
+            provider=provider,
+        )
     raise ValueError(f"Unsupported VOICE_PROVIDER: {settings.voice_provider}")
+
+
+_GEMINI_TURN_POLICY = (
+    "\n\nSPEECH OUTPUT\n"
+    "A separate text-to-speech engine reads your words aloud. "
+    "Write only the words the caller should hear.\n"
+    "The first sentence of every reply is one short clause, twelve words or fewer, "
+    "and it ends with a full stop. Later sentences may follow.\n"
+    "Do not put accent, voice, style, or stage directions in the words you write. "
+    "Do not say \"Australian English accent\" or describe how you sound.\n"
+    "Call record_opt_out and end_call as tools. Never speak a tool name.\n"
+)
+
+
+def _gemini_cascade(settings: Settings, instructions: str, opener: str) -> dict:
+    """Local plan. Nothing in here is sent to a realtime websocket."""
+    return {
+        "type": "gemini.cascade",
+        "instructions": instructions + _GEMINI_TURN_POLICY,
+        "opener": opener,
+        "tools": ["end_call", "record_opt_out"],
+        "tts": {
+            "model": settings.gemini_tts_model,
+            "voice": settings.gemini_tts_voice,
+            "style": settings.gemini_tts_style,
+            "language": settings.gemini_tts_language,
+        },
+        "stt": {
+            "provider": "deepgram",
+            "model": settings.deepgram_model,
+            "language": settings.deepgram_language,
+        },
+    }
 
 
 _AUDIO_DELTAS = {"response.output_audio.delta", "response.audio.delta"}
@@ -469,4 +522,12 @@ def provider_connection_target(settings: Settings) -> tuple[str, dict[str, str]]
     if provider == "gptlive":
         # Live rejects a model query string. The model is session.start's session.model.
         return settings.gptlive_url, {"Authorization": f"Bearer {settings.openai_api_key}"}
+    if provider == "gemini":
+        raise ValueError(
+            "VOICE_PROVIDER=gemini uses the cascaded pipeline, not a realtime websocket."
+        )
+    if provider == "geminilive":
+        from app.gemini_live import gemini_live_ws_url
+
+        return gemini_live_ws_url(settings.geminilive_url, settings.gemini_api_key), {}
     raise ValueError(f"Unsupported VOICE_PROVIDER: {settings.voice_provider}")

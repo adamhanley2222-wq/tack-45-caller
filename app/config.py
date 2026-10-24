@@ -69,8 +69,33 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
-    # Optional. Used only by POST /probe/tts. Calls do not read it.
+    # POST /probe/tts, the cascade (VOICE_PROVIDER=gemini), and Gemini Live
+    # (VOICE_PROVIDER=geminilive). Grok, OpenAI, and GPT-Live do not read it.
     gemini_api_key: str = ""
+    # Cascaded Gemini provider. Ignored unless VOICE_PROVIDER=gemini.
+    deepgram_api_key: str = ""
+    deepgram_url: str = "wss://api.deepgram.com/v1/listen"
+    deepgram_model: str = "nova-3"
+    deepgram_language: str = "en-AU"
+    # Silence, in milliseconds, before Deepgram ends a caller turn.
+    deepgram_endpointing_ms: int = 400
+    gemini_text_model: str = "gemini-2.5-flash"
+    gemini_tts_model: str = "gemini-3.8-flash-lite-tts"
+    gemini_tts_voice: str = "Charon"
+    gemini_tts_style: str = "Australian English accent, relaxed and friendly"
+    gemini_tts_language: str = "en-AU"
+    # 0 disables thinking on models that accept thinkingConfig. -1 omits the field.
+    gemini_thinking_budget: int = 0
+    # Gemini Live (VOICE_PROVIDER=geminilive). Native audio over one WebSocket.
+    # The accent string is system-instruction text, not words the model speaks.
+    geminilive_model: str = "gemini-3.8-live"
+    geminilive_url: str = (
+        "wss://generativelanguage.googleapis.com/ws/"
+        "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+    )
+    geminilive_voice: str = "Charon"
+    geminilive_language: str = "en-AU"
+    geminilive_style: str = "Australian English accent, relaxed and friendly"
 
     # Empty disables the finished-call webhook.
     transcript_webhook_url: str = ""
@@ -100,6 +125,14 @@ def missing_dial_configuration(settings: Settings) -> list[str]:
         missing.append("OPENAI_API_KEY")
     elif provider == "gptlive" and not settings.openai_api_key:
         missing.append("OPENAI_API_KEY")
-    elif provider not in {"grok", "openai", "gptlive"}:
+    elif provider == "gemini":
+        if not settings.gemini_api_key:
+            missing.append("GEMINI_API_KEY")
+        if not settings.deepgram_api_key:
+            missing.append("DEEPGRAM_API_KEY")
+    elif provider == "geminilive":
+        if not settings.gemini_api_key:
+            missing.append("GEMINI_API_KEY")
+    elif provider not in {"grok", "openai", "gptlive", "gemini", "geminilive"}:
         missing.append("VOICE_PROVIDER")
     return missing

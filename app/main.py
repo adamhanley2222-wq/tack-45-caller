@@ -44,6 +44,9 @@ def create_app(
             yield
         finally:
             await cancel_webhook_tasks(app.state.webhook_tasks)
+            from app.gemini_cascade import cancel_warm_tasks
+
+            await cancel_warm_tasks(getattr(app.state, "gemini_warm_tasks", None))
             await app.state.prewarm.aclose()
             await client.aclose()
             await database.dispose()

@@ -19,6 +19,13 @@ from typing import Any, Protocol
 from starlette.websockets import WebSocketDisconnect
 
 from app.audio import passthrough_audio, payload_nbytes
+from app.gemini_live import (
+    gemini_live_events,
+    gemini_live_opener,
+    realtime_audio_message,
+    session_identity,
+)
+from app.pcm_bridge import PcmBridge
 from app.providers import (
     NormalizedEvent,
     SessionPlan,
@@ -173,12 +180,17 @@ class RelayController:
         self.hangup_deadline: float | None = None
         self._partial_seq = 0
         # GPT-Live rejects audio until session.started. Grok and Realtime do not.
-        self.live_ready = plan.provider != "gptlive"
+        self.live_ready = plan.provider not in {"gptlive", "geminilive"}
         self.held_audio: list[str] = []
         self.playback_until = 0.0
         self.playback_started_at: float | None = None
         self.drop_output_before_ms: int | None = None
         self.session_close_sent = False
+        # Gemini Live rejects audio until setupComplete, same gate as GPT-Live.
+        self.pcm = PcmBridge()
+        self._gemini_in_turn = False
+        self._gemini_playback_until = 0.0
+        self._tool_names: dict[str, str] = {}
         self._live_turns = {
             "caller": {"id": None, "text": "", "end_ms": None},
             "assistant": {"id": None, "text": "", "end_ms": None},
@@ -206,6 +218,8 @@ class RelayController:
         return StepResult()
 
     def on_provider(self, event: dict) -> StepResult:
+        if self.plan.provider == "geminilive":
+            return self._on_gemini_live(event)
         norm = normalize_event(event)
         if self.plan.provider == "gptlive" and _gptlive_problem(event):
             logger.warning(
@@ -238,6 +252,112 @@ class RelayController:
             return StepResult()
         return StepResult()
 
+    def _on_gemini_live(self, event: dict) -> StepResult:
+        parts = [self._on_gemini_live_event(norm) for norm in gemini_live_events(event, self.pcm)]
+        return _merge_steps(parts)
+
+    def _on_gemini_live_event(self, norm: NormalizedEvent) -> StepResult:
+        if norm.kind == "session_started":
+            return self._on_session_started({})
+        if norm.kind == "audio":
+            if self.interrupted:
+                return self._on_audio(norm)
+            return _merge_steps([self._begin_gemini_turn(), self._on_audio(norm)])
+        if norm.kind == "speech_started":
+            return self._on_speech_started()
+        if norm.kind == "user_transcript":
+            return self._on_user_transcript(norm)
+        if norm.kind == "assistant_transcript":
+            if self.interrupted:
+                return StepResult()
+            return _merge_steps(
+                [self._begin_gemini_turn(), self._on_assistant_transcript(norm)]
+            )
+        if norm.kind == "function_call":
+            self._remember_tool(norm.name, norm.arguments, norm.call_id)
+            return self._emit_gemini_tools()
+        if norm.kind == "tool_cancelled":
+            self._cancel_gemini_tool(norm.call_id or "")
+            return StepResult()
+        if norm.kind == "response_done":
+            caller_lines = self._flush_user_partials()
+            step = self._on_response_done()
+            if caller_lines:
+                step.transcripts = caller_lines + step.transcripts
+            return step
+        if norm.kind == "go_away":
+            logger.warning(
+                "Gemini Live is closing the socket (time left: %s).",
+                norm.text or "unspecified",
+            )
+            return StepResult()
+        if norm.kind == "error":
+            logger.error("Gemini Live error: %s", norm.text)
+            return StepResult()
+        return StepResult()
+
+    def _begin_gemini_turn(self) -> StepResult:
+        if self._gemini_in_turn:
+            return StepResult()
+        self._gemini_in_turn = True
+        return self._on_response_created()
+
+    def _emit_gemini_tools(self) -> StepResult:
+        tools = self.pending_tools
+        self.pending_tools = []
+        result = StepResult()
+        for tool in tools:
+            message, opted = self._execute_tool(tool)
+            result.provider_messages.append(message)
+            if opted is not None:
+                result.opt_out_reason = opted
+        if self.hangup_requested:
+            self._arm_gemini_hangup(result)
+        return result
+
+    def _arm_gemini_hangup(self, result: StepResult) -> None:
+        """Hang up after audio already sent. Gemini has no response.create."""
+        if not self.hangup_requested or self.hung_up:
+            return
+        if self.awaiting_mark is not None and self.mark_purpose == "hangup":
+            return
+        remaining = self._remaining_playback()
+        if remaining <= 0:
+            remaining = max(0.0, self._gemini_playback_until - self.clock())
+        if self.interrupted or remaining <= 0:
+            result.provider_messages.extend(self._session_close_messages())
+            result.hangup = True
+            result.stop = True
+            result.end_reason = self.end_reason
+            return
+        if self.awaiting_mark is not None:
+            self.hangup_deadline = self.clock() + remaining + self.hangup_grace_seconds
+            return
+        self._queue_mark(result, "hangup")
+        self.hangup_deadline = self.clock() + remaining + self.hangup_grace_seconds
+
+    def _cancel_gemini_tool(self, call_id: str) -> None:
+        """Drop a tool the model retracted.
+
+        record_opt_out is not undone. The person already asked not to be called.
+        end_call can still be cancelled before the REST hangup goes out.
+        """
+        if not call_id:
+            return
+        was_pending = any(tool["call_id"] == call_id for tool in self.pending_tools)
+        self.pending_tools = [tool for tool in self.pending_tools if tool["call_id"] != call_id]
+        if was_pending or self._tool_names.get(call_id) != "end_call":
+            return
+        if self.opted_out or self.hung_up:
+            return
+        self.hangup_requested = False
+        self.hangup_deadline = None
+        if self.mark_purpose == "hangup":
+            self.awaiting_mark = None
+            self.mark_purpose = None
+        if self.end_reason.startswith("end_call:"):
+            self.end_reason = "completed"
+
     def _on_start(self, message: dict) -> StepResult:
         start = message.get("start") or {}
         self.stream_sid = start.get("streamSid") or message.get("streamSid")
@@ -264,6 +384,16 @@ class RelayController:
         if not payload:
             return StepResult()
         forwarded = passthrough_audio(payload)
+        if self.plan.provider == "geminilive":
+            # setupComplete has to land first, and the opener is not interrupted
+            # by caller audio. Dropping it here keeps the model from barging in
+            # on itself while Twilio playback is still protected.
+            if not self.live_ready or self.protecting_opener:
+                return StepResult()
+            message = realtime_audio_message(self.pcm, forwarded)
+            if message is None:
+                return StepResult()
+            return StepResult(provider_messages=[message])
         if self.plan.provider == "gptlive":
             if not self.live_ready:
                 self.held_audio.append(forwarded)
@@ -295,6 +425,21 @@ class RelayController:
 
     def _on_session_started(self, event: dict) -> StepResult:
         self.live_ready = True
+        if self.plan.provider == "geminilive":
+            # Caller audio buffered before setup is not useful and would
+            # interrupt the greeting. The opener goes out on its own.
+            self.held_audio.clear()
+            if self.plan.setup_messages:
+                voice, model = session_identity(self.plan.setup_messages[0])
+            else:
+                voice, model = "", ""
+            logger.info("Gemini Live session ready model=%s voice=%s", model or "-", voice or "-")
+            return StepResult(
+                provider_messages=[gemini_live_opener(self.opener)],
+                capture_provider_session=True,
+                provider_voice=voice or None,
+                provider_session_id=model or None,
+            )
         messages = [live_append_audio(payload) for payload in self.held_audio]
         self.held_audio.clear()
         result = StepResult(provider_messages=messages)
@@ -439,7 +584,15 @@ class RelayController:
             else:
                 self.protecting_opener = False
 
-        if self.hangup_requested:
+        if self.plan.provider == "geminilive":
+            self._gemini_playback_until = self.clock() + remaining
+            self._gemini_in_turn = False
+        already_hanging_up = (
+            self.plan.provider == "geminilive"
+            and self.awaiting_mark is not None
+            and self.mark_purpose == "hangup"
+        )
+        if self.hangup_requested and not already_hanging_up:
             if interrupted or not had_audio:
                 # Playback is already finished, so closing the Live session
                 # cannot cut off audio still in Twilio's buffer.
@@ -450,12 +603,12 @@ class RelayController:
             else:
                 self._queue_mark(result, "hangup")
                 self.hangup_deadline = self.clock() + remaining + self.hangup_grace_seconds
-        elif provider_messages:
+        elif provider_messages and self.plan.provider != "geminilive":
             if interrupted or not had_audio:
                 result.provider_messages.append(response_create())
             else:
                 self._queue_mark(result, "continue")
-        elif self.protecting_opener and had_audio:
+        elif self.protecting_opener and had_audio and not self.hangup_requested:
             self._queue_mark(result, "opener")
 
         self.response_first_audio_at = None
@@ -505,6 +658,18 @@ class RelayController:
     def _tool_result(self, call_id: str, payload: dict) -> dict:
         if self.plan.provider == "gptlive":
             return live_function_output(call_id, payload)
+        if self.plan.provider == "geminilive":
+            return {
+                "toolResponse": {
+                    "functionResponses": [
+                        {
+                            "id": call_id,
+                            "name": self._tool_names.get(call_id) or "",
+                            "response": payload,
+                        }
+                    ]
+                }
+            }
         return function_output(call_id, payload)
 
     def _session_close_messages(self) -> list[dict]:
@@ -594,6 +759,7 @@ class RelayController:
         if not name or not call_id or call_id in self.seen_tool_ids:
             return
         self.seen_tool_ids.add(call_id)
+        self._tool_names[call_id] = name
         self.pending_tools.append(
             {"name": name, "arguments": arguments or "{}", "call_id": call_id}
         )
@@ -695,6 +861,28 @@ class RelayController:
     def _next_partial_id(self) -> str:
         self._partial_seq += 1
         return f"partial-{self._partial_seq}"
+
+
+def _merge_steps(parts: list[StepResult]) -> StepResult:
+    merged = StepResult()
+    for part in parts:
+        merged.provider_messages.extend(part.provider_messages)
+        merged.twilio_messages.extend(part.twilio_messages)
+        merged.transcripts.extend(part.transcripts)
+        merged.drop_queued_audio = merged.drop_queued_audio or part.drop_queued_audio
+        if part.opt_out_reason is not None:
+            merged.opt_out_reason = part.opt_out_reason
+        if part.hangup:
+            merged.hangup = True
+        if part.stop:
+            merged.stop = True
+        if part.end_reason:
+            merged.end_reason = part.end_reason
+        if part.capture_provider_session:
+            merged.capture_provider_session = True
+            merged.provider_voice = part.provider_voice
+            merged.provider_session_id = part.provider_session_id
+    return merged
 
 
 def _voice_name(voice: Any) -> str:
