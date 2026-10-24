@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import json
 import logging
 import queue
@@ -492,8 +493,64 @@ def _speech_client(credentials: Any, location: str) -> Any:
     return SpeechClient(credentials=credentials, client_options=options)
 
 
+class _AudioBuffer:
+    """μ-law waiting for a streaming recognize session.
+
+    A session that is stopping does not take audio. Those chunks stay here
+    and the next session sends them.
+    """
+
+    def __init__(self) -> None:
+        self._items: collections.deque[bytes] = collections.deque()
+        self._cond = threading.Condition()
+        self.closed = False
+
+    def add(self, payload: bytes) -> None:
+        if not payload:
+            return
+        with self._cond:
+            if self.closed:
+                return
+            self._items.append(payload)
+            self._cond.notify()
+
+    def close(self) -> None:
+        with self._cond:
+            self.closed = True
+            self._cond.notify_all()
+
+    def wake(self) -> None:
+        with self._cond:
+            self._cond.notify_all()
+
+    def waiting(self) -> int:
+        with self._cond:
+            return len(self._items)
+
+    def take(self, stop: threading.Event) -> bytes | None:
+        """Next chunk, or None when this session must stop. None leaves the audio queued."""
+        with self._cond:
+            while not self._items and not self.closed and not stop.is_set():
+                self._cond.wait(timeout=0.2)
+            if stop.is_set() or self.closed:
+                return None
+            return self._items.popleft()
+
+    def wait_closed(self, timeout: float) -> None:
+        with self._cond:
+            if self.closed:
+                return
+            self._cond.wait(timeout=timeout)
+
+
 class GoogleStt:
-    """One StreamingRecognize call. Audio in, notices out. Nothing is logged from the key."""
+    """StreamingRecognize for the whole call.
+
+    Cloud Speech closes a stream after a final result, on endpointing, at the
+    roughly five-minute limit, or on a transient error. This opens another
+    stream and keeps audio queued across the gap. ``recv`` returns None only
+    after ``close``. Nothing from the service-account key is logged.
+    """
 
     def __init__(
         self,
@@ -505,6 +562,8 @@ class GoogleStt:
         language: str,
         endpoint_ms: int,
         secrets: list[str],
+        call_id: str = "",
+        client_factory: Callable[..., Any] | None = None,
     ) -> None:
         self._credentials = credentials
         self._project_id = project_id
@@ -513,9 +572,13 @@ class GoogleStt:
         self._language = language
         self._endpoint_ms = endpoint_ms
         self._secrets = secrets
-        self._audio: queue.Queue[bytes | None] = queue.Queue()
-        self._events: queue.Queue[SttNotice | Exception | None] = queue.Queue()
+        self._call_id = call_id
+        self._client_factory = client_factory or _speech_client
+        self._buffer = _AudioBuffer()
+        self._events: queue.Queue[SttNotice | None] = queue.Queue()
         self._thread: threading.Thread | None = None
+        self.closed = False
+        self.restarts = 0
 
     async def connect(self) -> None:
         if not self._project_id:
@@ -524,43 +587,93 @@ class GoogleStt:
         self._thread.start()
 
     async def send_audio(self, payload: bytes) -> None:
-        if payload:
-            self._audio.put(payload)
+        self._buffer.add(payload)
 
     async def recv(self) -> SttNotice | None:
-        item = await asyncio.to_thread(self._events.get)
-        if item is None:
-            return None
-        if isinstance(item, Exception):
-            raise item
-        return item
+        return await asyncio.to_thread(self._events.get)
 
     async def close(self) -> None:
-        self._audio.put(None)
+        if self.closed:
+            return
+        self.closed = True
+        self._buffer.close()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            await asyncio.to_thread(thread.join, 2.0)
+        self._events.put(None)
 
-    def _audio_chunks(self) -> Iterator[bytes]:
-        while True:
-            chunk = self._audio.get()
+    def _chunks(self, stop: threading.Event) -> Iterator[bytes]:
+        while not stop.is_set() and not self._buffer.closed:
+            chunk = self._buffer.take(stop)
             if chunk is None:
                 return
             yield chunk
 
-    def _run(self) -> None:
-        try:
-            client = _speech_client(self._credentials, self._location)
-            requests = recognize_requests(
-                self._project_id,
-                self._location,
-                self._language,
-                self._model,
-                self._endpoint_ms,
-                self._audio_chunks(),
+    def _log_restart(self, reason: str, exc: BaseException | None) -> None:
+        self.restarts += 1
+        if exc is None:
+            logger.info(
+                "Pipeline STT stream restarting call=%s restart=%d reason=%s buffered=%d",
+                self._call_id,
+                self.restarts,
+                reason,
+                self._buffer.waiting(),
             )
-            for response in client.streaming_recognize(requests=requests):
-                for notice in notices_from_stt(response):
-                    self._events.put(notice)
-        except Exception as exc:
-            self._events.put(RuntimeError(_redact(str(exc), *self._secrets)))
+            return
+        logger.warning(
+            "Pipeline STT stream restarting call=%s restart=%d reason=%s buffered=%d error=%s",
+            self._call_id,
+            self.restarts,
+            reason,
+            self._buffer.waiting(),
+            _redact(str(exc), *self._secrets),
+        )
+
+    def _run(self) -> None:
+        client = None
+        error_streak = 0
+        try:
+            while not self._buffer.closed:
+                if client is None:
+                    try:
+                        client = self._client_factory(self._credentials, self._location)
+                    except Exception as exc:
+                        self._log_restart("client", exc)
+                        error_streak += 1
+                        self._buffer.wait_closed(min(2.0, 0.05 * (2 ** min(error_streak, 5))))
+                        continue
+                stop = threading.Event()
+                got_response = False
+                exc: BaseException | None = None
+                try:
+                    requests = recognize_requests(
+                        self._project_id,
+                        self._location,
+                        self._language,
+                        self._model,
+                        self._endpoint_ms,
+                        self._chunks(stop),
+                    )
+                    for response in client.streaming_recognize(requests=requests):
+                        if self._buffer.closed:
+                            break
+                        got_response = True
+                        for notice in notices_from_stt(response):
+                            self._events.put(notice)
+                except Exception as stream_exc:
+                    exc = stream_exc
+                finally:
+                    stop.set()
+                    self._buffer.wake()
+                if self._buffer.closed:
+                    break
+                # A clean end is a final result, endpointing, or the stream time limit.
+                self._log_restart("error" if exc is not None else "ended", exc)
+                if got_response:
+                    error_streak = 0
+                    continue
+                error_streak += 1
+                self._buffer.wait_closed(min(2.0, 0.05 * (2 ** min(error_streak, 5))))
         finally:
             self._events.put(None)
 
@@ -735,6 +848,7 @@ async def run_pipeline(
                 language=settings.pipeline_stt_language,
                 endpoint_ms=settings.pipeline_stt_endpoint_ms,
                 secrets=secrets,
+                call_id=controller.call_id,
             )
         if tts_factory is None:
             tts_factory = lambda: CloudStreamingSpeaker(
@@ -1000,21 +1114,29 @@ async def run_pipeline(
                 await finish(reason)
 
     async def stt_reader() -> None:
-        while True:
+        # A recognize stream ending is not a hangup. Twilio stop and the
+        # end-call path are what finish the call.
+        while not finished and not controller.hung_up:
             try:
                 notice = await listener.recv()
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 logger.error(
-                    "Pipeline speech stream ended on %s: %s",
+                    "Pipeline speech notice failed on %s: %s. The call stays up.",
                     controller.call_id,
                     _redact(str(exc), *secrets),
                 )
-                notice = None
+                await asyncio.sleep(0.2)
+                continue
             if notice is None:
-                if not controller.hung_up and not finished:
-                    reason = controller.end_reason if controller.end_reason != "completed" else "stt_closed"
-                    await finish(reason)
-                return
+                if finished or controller.hung_up or getattr(listener, "closed", False):
+                    return
+                logger.error(
+                    "Pipeline speech listener stopped on %s. The call stays up.",
+                    controller.call_id,
+                )
+                continue
             started, text = turns.push(notice)
             if started:
                 latency.log()
@@ -1085,6 +1207,10 @@ async def run_pipeline(
                     await finish("relay_error")
     finally:
         reply = llm_task
+        try:
+            await listener.close()
+        except Exception:
+            logger.error("Failed to close the speech stream for %s", controller.call_id)
         for task in tasks:
             task.cancel()
         if reply is not None and not reply.done():
@@ -1093,10 +1219,6 @@ async def run_pipeline(
         await asyncio.gather(*tasks, return_exceptions=True)
         if reply is not None:
             await asyncio.gather(reply, return_exceptions=True)
-        try:
-            await listener.close()
-        except Exception:
-            pass
 
 
 async def _finish_now(controller: PipelineController, store, gateway, reason: str) -> None:

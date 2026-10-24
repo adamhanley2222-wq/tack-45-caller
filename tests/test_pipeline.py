@@ -391,7 +391,13 @@ class FakeStt:
         return notice
 
     async def close(self) -> None:
+        if self.closed:
+            return
         self.closed = True
+        await self._events.put(None)
+
+    async def close_stream(self) -> None:
+        """The recognize stream ended. The listener itself stays open."""
         await self._events.put(None)
 
     async def push(self, notice: SttNotice, at: float | None) -> None:
@@ -558,6 +564,163 @@ async def test_turn_latency_clause_flush_and_barge_in(tmp_path, caplog):
     assert store.in_progress is True
     assert gateway.hungup == []
     assert listener.closed is True
+
+
+class TwoTurnModel:
+    def __init__(self) -> None:
+        self.calls: list[list[dict]] = []
+
+    async def stream_reply(self, *, instructions: str, transcript: list[dict]):
+        self.calls.append(list(transcript))
+        yield ModelEvent(text="Thanks, is now a good time?")
+
+
+async def test_stt_closing_after_a_final_does_not_end_the_call(tmp_path, caplog):
+    """The recognize stream closed after "yes". The next turn still runs."""
+    import asyncio
+
+    caplog.set_level(logging.ERROR, logger="tack45.pipeline")
+    clock = Clock()
+    controller = _controller(clock, hold=False)
+    listener = FakeStt(clock)
+    model = TwoTurnModel()
+    sink = SpeakerSink(clock)
+    store = MemoryStore()
+    twilio = MemoryTwilio()
+    task = asyncio.create_task(
+        run_pipeline(
+            twilio_ws=twilio,
+            settings=_run_settings(tmp_path),
+            controller=controller,
+            store=store,
+            gateway=MemoryGateway(),
+            listener=listener,
+            text_model=model,
+            tts_factory=lambda: FakeSpeaker(sink),
+        )
+    )
+    await twilio.inject({"event": "connected"})
+    await twilio.inject(START)
+    await _echo_mark(twilio)
+    await _until(lambda: controller.protecting_opener is False)
+
+    await listener.push(SttNotice(text="Yes.", is_final=True), at=1.0)
+    await _until(lambda: len(model.calls) == 1)
+    await _until(lambda: any("good time" in text for text in sink.texts))
+    await listener.close_stream()
+    await asyncio.sleep(0.1)
+    assert store.finished is None
+    assert "The call stays up." in caplog.text
+
+    await listener.push(SttNotice(text="Sounds good.", is_final=True), at=2.0)
+    await _until(lambda: len(model.calls) == 2)
+    caller = [line["text"] for line in model.calls[1] if line["role"] == "caller"]
+    assert caller == ["Yes.", "Sounds good."]
+    assert store.finished is None
+
+    await twilio.inject({"event": "stop", "streamSid": "MZ1"})
+    await asyncio.wait_for(task, 2)
+    assert store.finished["end_reason"] == "caller_hangup"
+
+
+def _stt_final(text: str):
+    from google.cloud.speech_v2.types import cloud_speech
+
+    return cloud_speech.StreamingRecognizeResponse(
+        results=[
+            cloud_speech.StreamingRecognitionResult(
+                alternatives=[cloud_speech.SpeechRecognitionAlternative(transcript=text)],
+                is_final=True,
+            )
+        ]
+    )
+
+
+class OneShotStreams:
+    """Each streaming_recognize call yields one final, then the stream ends."""
+
+    def __init__(self, *, fail_first: str | None = None) -> None:
+        self.fail_first = fail_first
+        self.streams: list[list[bytes]] = []
+        self.attempts = 0
+
+    def streaming_recognize(self, requests):
+        self.attempts += 1
+        if self.fail_first and self.attempts == 1:
+            raise RuntimeError(self.fail_first)
+        try:
+            next(requests)
+            chunk = next(requests)
+        except StopIteration:
+            return
+        audio = bytes(chunk.audio)
+        self.streams.append([audio])
+        text = "Yes." if len(self.streams) == 1 else "Sounds good."
+        yield _stt_final(text)
+
+
+def _google_stt(client: OneShotStreams) -> GoogleStt:
+    from app.pipeline import GoogleStt
+
+    return GoogleStt(
+        object(),
+        project_id="tack45-test",
+        location="global",
+        model="telephony",
+        language="en-AU",
+        endpoint_ms=500,
+        secrets=["FAKE-CLOUD-TTS-PRIVATE-KEY-SECRET"],
+        call_id="c1",
+        client_factory=lambda _credentials, _location: client,
+    )
+
+
+async def test_google_stt_reopens_after_a_final_and_keeps_buffered_audio(caplog):
+    import asyncio
+
+    caplog.set_level(logging.INFO, logger="tack45.pipeline")
+    client = OneShotStreams()
+    stt = _google_stt(client)
+    await stt.connect()
+    try:
+        await stt.send_audio(b"yes-audio")
+        first = await asyncio.wait_for(stt.recv(), 2)
+        assert first is not None
+        assert first.text == "Yes."
+        assert first.is_final is True
+        await stt.send_audio(b"next-audio")
+        second = await asyncio.wait_for(stt.recv(), 2)
+        assert second is not None
+        assert second.text == "Sounds good."
+        assert client.streams == [[b"yes-audio"], [b"next-audio"]]
+        assert stt.restarts >= 1
+        assert "Pipeline STT stream restarting" in caplog.text
+        assert "reason=ended" in caplog.text
+        assert "FAKE-CLOUD-TTS-PRIVATE-KEY-SECRET" not in caplog.text
+        assert stt.closed is False
+    finally:
+        await stt.close()
+
+
+async def test_google_stt_reopens_after_a_stream_error(caplog):
+    import asyncio
+
+    caplog.set_level(logging.INFO, logger="tack45.pipeline")
+    secret = "FAKE-CLOUD-TTS-PRIVATE-KEY-SECRET"
+    client = OneShotStreams(fail_first=f"UNAVAILABLE {secret}")
+    stt = _google_stt(client)
+    await stt.connect()
+    try:
+        await stt.send_audio(b"yes-audio")
+        notice = await asyncio.wait_for(stt.recv(), 2)
+        assert notice is not None
+        assert notice.text == "Yes."
+        assert client.attempts >= 2
+        assert client.streams == [[b"yes-audio"]]
+        assert "reason=error" in caplog.text
+        assert secret not in caplog.text
+    finally:
+        await stt.close()
 
 
 async def test_opt_out_is_recorded_before_the_goodbye_finishes(tmp_path):
