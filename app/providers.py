@@ -1,8 +1,12 @@
-"""Realtime session setup for xAI Grok Voice, OpenAI Realtime, and GPT-Live.
+"""Realtime session setup for xAI Grok Voice, OpenAI Realtime, GPT-Live, and Gemini Live.
 
 ``VOICE_PROVIDER=gemini`` does not open one of these sockets. It returns a
 local cascade plan (instructions plus the opener). The media route runs that
 plan through the Deepgram / Gemini pipeline instead of ``run_relay``.
+
+``VOICE_PROVIDER=geminilive`` does open a socket: the Gemini Live API. Twilio
+μ-law is resampled to 16 kHz PCM on the way in and from 24 kHz PCM on the way
+out. Grok, OpenAI, and GPT-Live still forward μ-law unchanged.
 
 Grok and OpenAI Realtime are configured for ``audio/pcmu`` (G.711 μ-law,
 8 kHz) with no sample-rate field: 8 kHz is the codec, and adding a PCM rate
@@ -301,6 +305,13 @@ def build_session_plan(settings: Settings, instructions: str, opener: str) -> Se
             setup_messages=[_gemini_cascade(settings, instructions, opener)],
             provider=provider,
         )
+    if provider == "geminilive":
+        from app.gemini_live import gemini_live_setup
+
+        return SessionPlan(
+            setup_messages=[gemini_live_setup(settings, instructions)],
+            provider=provider,
+        )
     raise ValueError(f"Unsupported VOICE_PROVIDER: {settings.voice_provider}")
 
 
@@ -515,4 +526,8 @@ def provider_connection_target(settings: Settings) -> tuple[str, dict[str, str]]
         raise ValueError(
             "VOICE_PROVIDER=gemini uses the cascaded pipeline, not a realtime websocket."
         )
+    if provider == "geminilive":
+        from app.gemini_live import gemini_live_ws_url
+
+        return gemini_live_ws_url(settings.geminilive_url, settings.gemini_api_key), {}
     raise ValueError(f"Unsupported VOICE_PROVIDER: {settings.voice_provider}")

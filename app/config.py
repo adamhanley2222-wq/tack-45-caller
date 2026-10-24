@@ -69,7 +69,8 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
-    # POST /probe/tts, and the text model plus TTS when VOICE_PROVIDER=gemini.
+    # POST /probe/tts, the cascade (VOICE_PROVIDER=gemini), and Gemini Live
+    # (VOICE_PROVIDER=geminilive). Grok, OpenAI, and GPT-Live do not read it.
     gemini_api_key: str = ""
     # Cascaded Gemini provider. Ignored unless VOICE_PROVIDER=gemini.
     deepgram_api_key: str = ""
@@ -85,6 +86,16 @@ class Settings(BaseSettings):
     gemini_tts_language: str = "en-AU"
     # 0 disables thinking on models that accept thinkingConfig. -1 omits the field.
     gemini_thinking_budget: int = 0
+    # Gemini Live (VOICE_PROVIDER=geminilive). Native audio over one WebSocket.
+    # The accent string is system-instruction text, not words the model speaks.
+    geminilive_model: str = "gemini-3.8-live"
+    geminilive_url: str = (
+        "wss://generativelanguage.googleapis.com/ws/"
+        "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+    )
+    geminilive_voice: str = "Charon"
+    geminilive_language: str = "en-AU"
+    geminilive_style: str = "Australian English accent, relaxed and friendly"
 
     # Empty disables the finished-call webhook.
     transcript_webhook_url: str = ""
@@ -119,6 +130,9 @@ def missing_dial_configuration(settings: Settings) -> list[str]:
             missing.append("GEMINI_API_KEY")
         if not settings.deepgram_api_key:
             missing.append("DEEPGRAM_API_KEY")
-    elif provider not in {"grok", "openai", "gptlive", "gemini"}:
+    elif provider == "geminilive":
+        if not settings.gemini_api_key:
+            missing.append("GEMINI_API_KEY")
+    elif provider not in {"grok", "openai", "gptlive", "gemini", "geminilive"}:
         missing.append("VOICE_PROVIDER")
     return missing

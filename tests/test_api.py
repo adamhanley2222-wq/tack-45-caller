@@ -488,10 +488,21 @@ async def test_amd_reason_survives_the_relay_finishing(tmp_path):
 
 
 def test_no_transcode_imports():
+    """Grok, OpenAI, GPT-Live, and the cascade do not resample.
+
+    Gemini Live is the exception: ``app/pcm_bridge.py`` uses the stdlib
+    ``audioop`` codec. No other resampler is imported anywhere.
+    """
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1] / "app"
-    text = "\n".join(path.read_text(encoding="utf-8") for path in root.rglob("*.py"))
-    for banned in ("audioop", "soxr", "samplerate", "librosa", "numpy", "pydub"):
-        assert f"import {banned}" not in text
-        assert f"from {banned}" not in text
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for banned in ("soxr", "samplerate", "librosa", "numpy", "pydub"):
+            assert f"import {banned}" not in text
+            assert f"from {banned}" not in text
+        if path.name == "pcm_bridge.py":
+            assert "import audioop" in text
+            continue
+        assert "import audioop" not in text
+        assert "from audioop" not in text
