@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     # POST /probe/tts, the cascade (VOICE_PROVIDER=gemini), and Gemini Live
     # (VOICE_PROVIDER=geminilive). Grok, OpenAI, and GPT-Live do not read it.
     gemini_api_key: str = ""
+    # POST /probe/tts with provider "cloudtts" only. Calls do not read it.
+    google_tts_api_key: str = ""
     # Cascaded Gemini provider. Ignored unless VOICE_PROVIDER=gemini.
     deepgram_api_key: str = ""
     deepgram_url: str = "wss://api.deepgram.com/v1/listen"

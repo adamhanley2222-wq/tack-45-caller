@@ -254,6 +254,7 @@ When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The 
 | `HANGUP_GRACE_SECONDS` | no | Extra wait after playback before the hangup watchdog. Default 8 |
 | `LOG_LEVEL` | no | Default `INFO` |
 | `GEMINI_API_KEY` | when provider is gemini or geminilive | Cascade text and TTS, Gemini Live, and `POST /probe/tts`. Grok, OpenAI, and GPT-Live do not read it |
+| `GOOGLE_TTS_API_KEY` | no | Admin `POST /probe/tts` with `provider: "cloudtts"` only. Calls do not use it |
 | `DEEPGRAM_API_KEY` | when provider is gemini | Streaming speech-to-text for the cascade. Gemini Live does not use it |
 | `DEEPGRAM_URL` | no | Default `wss://api.deepgram.com/v1/listen` |
 | `DEEPGRAM_MODEL` | no | Default `nova-3` |
@@ -304,9 +305,11 @@ Set `TWILIO_AUTH_TOKEN` (the account auth token, not the API key) if you want we
 
 ## TTS latency probe
 
-`POST /probe/tts` is an admin check for Gemini Flash-Lite speech latency. It uses the same bearer token as `/calls` and does not dial or open a voice session. `GEMINI_API_KEY` is optional; without it the route returns 503 and startup is unchanged.
+`POST /probe/tts` is an admin check for speech latency. It uses the same bearer token as `/calls` and does not dial or open a voice session. `provider` is `gemini` (the default) or `cloudtts`. `GEMINI_API_KEY` is optional; without it a Gemini probe returns 503 and startup is unchanged. `GOOGLE_TTS_API_KEY` is optional; without it a Cloud TTS probe returns 400 and startup is unchanged. Calls never read that key.
 
-The body may set `sentences`, `runs_per_sentence` (default 1), `style`, `voice`, `model`, and `save_samples` (default 3). Omitted sentences are about twenty short Tack45 lines. Each request is `gemini-3.8-flash-lite-tts` on the Interactions API with `stream: true`, μ-law at 8 kHz, and the style `Australian English accent, relaxed and friendly` unless overridden. The voice goes in `generation_config.speech_config` and defaults to `Kore`.
+The body may set `sentences`, `runs_per_sentence` (default 1), `style`, `voice`, `model`, and `save_samples` (default 3). Omitted sentences are about twenty short Tack45 lines. A Gemini probe calls `gemini-3.8-flash-lite-tts` on the Interactions API with `stream: true`, μ-law at 8 kHz, and the style `Australian English accent, relaxed and friendly` unless overridden. The voice goes in `generation_config.speech_config` and defaults to `Kore`. The result records `method: "interactions"`.
+
+A Cloud TTS probe uses Chirp 3 HD. The default voice is `en-AU-Chirp3-HD-Charon` and `languageCode` is `en-AU`. StreamingSynthesize is a bidirectional gRPC method. Its documented credential is an OAuth token for `https://www.googleapis.com/auth/cloud-platform`, and the method is not in the REST discovery document, so an API key cannot reach it. The probe therefore calls REST `text:synthesize` (`method: "text:synthesize"`) with `audioEncoding: MULAW` and `sampleRateHertz: 8000`. The key is sent in the `X-Goog-Api-Key` header and is not logged. That response is one JSON body, so time to the first audio byte and total time are the time until that audio is decoded. MULAW audio includes a WAV header, which is stripped before the clip is stored. If the body is 16-bit PCM instead, it is converted to 8 kHz μ-law and `conversion_ms` on the run is only that conversion.
 
 The JSON reports time to first audio byte and total time for each run, p50/p90/min/max, audio bytes and seconds, and `RAILWAY_REPLICA_REGION` when that environment variable is set. Up to `save_samples` clips are returned as base64 μ-law and kept in memory for `GET /probe/tts/sample/{n}.wav`.
 
