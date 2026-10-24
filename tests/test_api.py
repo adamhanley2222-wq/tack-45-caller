@@ -169,10 +169,7 @@ def test_answer_connects_immediately_and_prewarms_before_amd(client, monkeypatch
     assert len(seen["providers"]) == 1
     provider = seen["providers"][0]
     assert provider.connected is True
-    assert provider.sent[0]["type"] == "session.update"
-    opener = provider.sent[1]
-    assert opener["item"]["type"] == "force_message"
-    assert opener["item"]["content"][0]["text"] == "Hi, is this Pat?"
+    assert [item.get("type") for item in provider.sent] == ["session.update"]
     instructions = provider.sent[0]["session"]["instructions"]
     assert "Thanks Pat. I'm an AI assistant calling for Tack45" in instructions
     assert "has already been spoken" not in instructions
@@ -319,7 +316,7 @@ def test_late_unknown_amd_does_not_hang_up_a_live_call(client, monkeypatch):
         data={"CallSid": created["call_sid"]},
     )
     assert "<Connect>" in voice.text
-    assert seen["providers"][0].sent[1]["item"]["content"][0]["text"] == "Hi, is this Marc?"
+    assert [item.get("type") for item in seen["providers"][0].sent] == ["session.update"]
     before = len(seen["requests"])
     late = http.post(
         f"/twilio/amd?call_id={created['id']}",

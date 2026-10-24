@@ -63,7 +63,7 @@ def test_brief_id_loads_the_file_and_replaces_the_confirmation_line(client, monk
     )
     assert voice.status_code == 200
     provider = seen["providers"][0]
-    assert provider.sent[1]["item"]["content"][0]["text"] == "Hi, is this Marc?"
+    assert [item.get("type") for item in provider.sent] == ["session.update"]
     instructions = provider.sent[0]["session"]["instructions"]
     brief = (ROOT / "prompts" / "briefs" / "barrenjoey-marc.md").read_text(encoding="utf-8").strip()
     assert instructions.rstrip().endswith(brief)
@@ -99,7 +99,7 @@ def test_inline_brief_is_appended(client, monkeypatch):
     )
     assert voice.status_code == 200
     provider = seen["providers"][0]
-    assert provider.sent[1]["item"]["content"][0]["text"] == "Hi, is this Sam?"
+    assert [item.get("type") for item in provider.sent] == ["session.update"]
     instructions = provider.sent[0]["session"]["instructions"]
     assert BRIEF_HEADING in instructions
     assert "Ask about the roastery inbox, then the meeting ask." in instructions

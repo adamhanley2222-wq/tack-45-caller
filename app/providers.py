@@ -25,6 +25,7 @@ a top-level ``tools`` field; startup rejects unknown session fields.
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass
 from urllib.parse import urlencode
@@ -119,6 +120,51 @@ def opener_response(text: str) -> dict:
             )
         },
     }
+
+
+def is_spoken_opener(message: dict) -> bool:
+    """A setup message that makes the model speak, rather than session config."""
+    if not isinstance(message, dict):
+        return False
+    if message.get("type") == "response.create":
+        return True
+    item = message.get("item")
+    return isinstance(item, dict) and item.get("type") == "force_message"
+
+
+def gptlive_greeting_text(opener: str) -> str:
+    return (
+        "Greet the caller now in English. Say exactly these words "
+        "and nothing else, then pause and listen:\n\n"
+        + opener
+    )
+
+
+def gptlive_opener_commentary(opener: str) -> dict:
+    """Speak the opener after session.started. Not part of session.start.
+
+    Sending the greeting inside session.start makes GPT-Live talk as soon as
+    the socket is up. commentary.append is the documented follow-up that asks
+    it to speak once the session is already running.
+    """
+    return {
+        "type": "session.commentary.append",
+        "event_id": "opener_1",
+        "delegation_id": None,
+        "content": gptlive_greeting_text(opener),
+    }
+
+
+def without_gptlive_greeting(message: dict) -> dict:
+    """session.start with the speak-now developer input removed. Other messages pass through."""
+    if not isinstance(message, dict) or message.get("type") != "session.start":
+        return message
+    session = message.get("session")
+    if not isinstance(session, dict) or "input" not in session:
+        return message
+    cloned = copy.deepcopy(message)
+    cloned["session"].pop("input", None)
+    return cloned
 
 
 def append_audio(payload_b64: str) -> dict:
@@ -270,11 +316,7 @@ def _gptlive_session(settings: Settings, instructions: str, opener: str) -> dict
                     "content": [
                         {
                             "type": "input_text",
-                            "text": (
-                                "Greet the caller now in English. Say exactly these words "
-                                "and nothing else, then pause and listen:\n\n"
-                                + opener
-                            ),
+                            "text": gptlive_greeting_text(opener),
                         }
                     ],
                 }
