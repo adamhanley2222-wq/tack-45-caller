@@ -10,6 +10,7 @@ watchdog if that echo never arrives.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -26,17 +27,21 @@ from app.gemini_live import (
     session_identity,
 )
 from app.pcm_bridge import PcmBridge
+from app.opener_vad import OpenerVad
 from app.providers import (
     NormalizedEvent,
     SessionPlan,
     append_audio,
     function_calls_in_response,
     function_output,
+    gptlive_opener_commentary,
+    is_spoken_opener,
     live_append_audio,
     live_function_output,
     normalize_event,
     response_create,
     session_close,
+    without_gptlive_greeting,
 )
 
 logger = logging.getLogger("tack45.relay")
@@ -101,6 +106,15 @@ class StepResult:
     provider_session_id: str | None = None
 
 
+def messages_before_opener(plan: SessionPlan, *, hold_opener: bool) -> list[dict]:
+    """Session setup to send now. The spoken opener stays out when ``hold_opener`` is set."""
+    if not hold_opener:
+        return list(plan.setup_messages)
+    if plan.provider == "gptlive":
+        return [without_gptlive_greeting(message) for message in plan.setup_messages]
+    return [message for message in plan.setup_messages if not is_spoken_opener(message)]
+
+
 def drain_queued_audio(queue: asyncio.Queue) -> int:
     """Remove media frames waiting to be sent. Keep marks and other events."""
     kept: list[Any] = []
@@ -145,6 +159,9 @@ class RelayController:
         hangup_grace_seconds: float = 8.0,
         clock=time.monotonic,
         setup_sent: bool = False,
+        opener_wait_for_speech: bool = False,
+        opener_silence_ms: int = 500,
+        opener_max_wait_ms: int = 2500,
     ) -> None:
         self.call_id = call_id
         self.call_sid = call_sid
@@ -154,6 +171,14 @@ class RelayController:
         self.hangup_grace_seconds = hangup_grace_seconds
         self.clock = clock
         self.setup_sent = setup_sent
+        self.opener_wait_for_speech = opener_wait_for_speech
+        self.opener_silence_ms = opener_silence_ms
+        self.opener_max_wait_ms = opener_max_wait_ms
+        # Released means the wait is over. Sent means the provider was told to speak.
+        self.opener_released = not opener_wait_for_speech
+        self.opener_sent = not opener_wait_for_speech
+        self.stream_started_at: float | None = None
+        self._vad = OpenerVad(silence_ms=opener_silence_ms, max_wait_ms=opener_max_wait_ms)
 
         self.stream_sid: str | None = None
         self.started = False
@@ -219,6 +244,8 @@ class RelayController:
 
     def on_provider(self, event: dict) -> StepResult:
         if self.plan.provider == "geminilive":
+            if self._block_model_output() and not _gemini_session_or_error(event):
+                return StepResult()
             return self._on_gemini_live(event)
         norm = normalize_event(event)
         if self.plan.provider == "gptlive" and _gptlive_problem(event):
@@ -226,6 +253,12 @@ class RelayController:
                 "GPT-Live event: %s",
                 json.dumps(_redact_audio(event), default=str),
             )
+        if norm.kind == "error":
+            if self.plan.provider != "gptlive":
+                logger.error("Provider error: %s", norm.text)
+            return StepResult()
+        if self._block_model_output() and norm.kind != "session_started":
+            return StepResult()
         if norm.kind == "session_started":
             return self._on_session_started(event)
         if norm.kind == "session_closed":
@@ -246,10 +279,6 @@ class RelayController:
         if norm.kind == "response_done":
             self._collect_function_calls(event)
             return self._on_response_done()
-        if norm.kind == "error":
-            if self.plan.provider != "gptlive":
-                logger.error("Provider error: %s", norm.text)
-            return StepResult()
         return StepResult()
 
     def _on_gemini_live(self, event: dict) -> StepResult:
@@ -364,6 +393,13 @@ class RelayController:
         self.stream_sid = start.get("streamSid") or message.get("streamSid")
         self.call_sid = start.get("callSid") or self.call_sid
         self.started = True
+        if self.opener_wait_for_speech:
+            self.stream_started_at = self.clock()
+            self._vad.start(self.clock())
+            # Session config may already be on the wire. The opener stays held.
+            messages = [] if self.setup_sent else messages_before_opener(self.plan, hold_opener=True)
+            self.setup_sent = True
+            return StepResult(provider_messages=messages)
         line = self._commit("assistant", self.opener)
         # The session and opener are normally already on the wire. Sending
         # them again would speak the check twice.
@@ -384,6 +420,8 @@ class RelayController:
         payload = media.get("payload") or ""
         if not payload:
             return StepResult()
+        if self._block_caller_audio():
+            return self._watch_for_opener(payload)
         forwarded = passthrough_audio(payload)
         if self.plan.provider == "geminilive":
             # setupComplete has to land first, and the opener is not interrupted
@@ -428,7 +466,8 @@ class RelayController:
         self.live_ready = True
         if self.plan.provider == "geminilive":
             # Caller audio buffered before setup is not useful and would
-            # interrupt the greeting. The opener goes out on its own.
+            # interrupt the greeting. The opener goes out on its own, unless
+            # we are still waiting for the person called to finish saying hello.
             self.held_audio.clear()
             if self.plan.setup_messages:
                 voice, model = session_identity(self.plan.setup_messages[0])
@@ -441,15 +480,27 @@ class RelayController:
                 voice or "-",
                 server_id or "-",
             )
+            if self.opener_wait_for_speech:
+                messages, lines = self._send_pending_opener()
+            else:
+                messages, lines = [gemini_live_opener(self.opener)], []
             return StepResult(
-                provider_messages=[gemini_live_opener(self.opener)],
+                provider_messages=messages,
+                transcripts=lines,
                 capture_provider_session=True,
                 provider_voice=voice or None,
                 provider_session_id=server_id or model or None,
             )
-        messages = [live_append_audio(payload) for payload in self.held_audio]
-        self.held_audio.clear()
-        result = StepResult(provider_messages=messages)
+        pending, lines = self._send_pending_opener()
+        if self._block_caller_audio():
+            # Hello arrived before the opener. Drop it so it cannot start a turn.
+            self.held_audio.clear()
+            queued: list[dict] = []
+        else:
+            queued = [live_append_audio(payload) for payload in self.held_audio]
+            self.held_audio.clear()
+        messages = pending + queued
+        result = StepResult(provider_messages=messages, transcripts=lines)
         if self.plan.provider != "gptlive":
             return result
         session = event.get("session") if isinstance(event.get("session"), dict) else {}
@@ -471,6 +522,8 @@ class RelayController:
         return result
 
     def _on_audio(self, norm: NormalizedEvent) -> StepResult:
+        if self._block_model_output():
+            return StepResult()
         if not norm.audio_b64 or not self.stream_sid:
             return StepResult()
         if (
@@ -869,6 +922,70 @@ class RelayController:
         self._partial_seq += 1
         return f"partial-{self._partial_seq}"
 
+    def _block_caller_audio(self) -> bool:
+        """Caller audio before the opener is sent must not start its own reply."""
+        return self.opener_wait_for_speech and not self.opener_sent
+
+    def _block_model_output(self) -> bool:
+        """The provider must not speak until we have asked for the opener."""
+        return self.opener_wait_for_speech and not self.opener_sent
+
+    def _opener_channel_ready(self) -> bool:
+        if self.plan.provider in {"gptlive", "geminilive"}:
+            return self.live_ready
+        return True
+
+    def _deferred_opener_messages(self) -> list[dict]:
+        if self.plan.provider == "geminilive":
+            return [gemini_live_opener(self.opener)]
+        if self.plan.provider == "gptlive":
+            return [gptlive_opener_commentary(self.opener)]
+        return [message for message in self.plan.setup_messages if is_spoken_opener(message)]
+
+    def _watch_for_opener(self, payload: str) -> StepResult:
+        try:
+            mulaw = base64.b64decode(payload, validate=False)
+        except Exception:
+            mulaw = b""
+        decision = self._vad.feed(mulaw, self.clock())
+        if decision is None:
+            return StepResult()
+        return self._release_opener(decision)
+
+    def poll_opener(self) -> StepResult | None:
+        """Fire the timeout when the stream is up and no frame has arrived."""
+        if not self.opener_wait_for_speech or self.opener_released or not self.started:
+            return None
+        decision = self._vad.poll(self.clock())
+        if decision is None:
+            return None
+        return self._release_opener(decision)
+
+    def _release_opener(self, reason: str) -> StepResult:
+        if self.opener_released:
+            return StepResult()
+        self.opener_released = True
+        elapsed_ms = 0
+        if self.stream_started_at is not None:
+            elapsed_ms = max(0, int(round((self.clock() - self.stream_started_at) * 1000)))
+        if reason == "speech":
+            logger.info("Opener triggered by speech after %d ms", elapsed_ms)
+        else:
+            logger.info("Opener triggered by the timeout after %d ms", elapsed_ms)
+        if not self._opener_channel_ready():
+            return StepResult()
+        messages, lines = self._send_pending_opener()
+        return StepResult(provider_messages=messages, transcripts=lines)
+
+    def _send_pending_opener(self) -> tuple[list[dict], list[dict]]:
+        if not self.opener_wait_for_speech or not self.opener_released or self.opener_sent:
+            return [], []
+        if not self._opener_channel_ready():
+            return [], []
+        self.opener_sent = True
+        line = self._commit("assistant", self.opener)
+        return self._deferred_opener_messages(), ([line] if line else [])
+
 
 def _merge_steps(parts: list[StepResult]) -> StepResult:
     merged = StepResult()
@@ -890,6 +1007,15 @@ def _merge_steps(parts: list[StepResult]) -> StepResult:
             merged.provider_voice = part.provider_voice
             merged.provider_session_id = part.provider_session_id
     return merged
+
+
+def _gemini_session_or_error(event: dict) -> bool:
+    """setupComplete and errors still matter while the opener is held."""
+    if not isinstance(event, dict):
+        return False
+    if "setupComplete" in event or "setup_complete" in event:
+        return True
+    return "error" in event
 
 
 def _voice_name(voice: Any) -> str:
@@ -944,14 +1070,18 @@ async def run_relay(
 ) -> None:
     """Bridge one Twilio media stream to one provider socket until the call ends.
 
-    Session configuration and the opener go out as soon as the provider
-    socket is up. They do not wait for Twilio's ``start`` event. Provider
-    audio is held until that event, so frames that arrive during the
-    handshake are forwarded instead of dropped.
+    Session configuration goes out as soon as the provider socket is up.
+    It does not wait for Twilio's ``start`` event. When the outbound opener
+    wait is on, the message that speaks the opener stays held until the
+    caller has talked and gone quiet. Provider audio is held until ``start``,
+    so frames that arrive during the handshake are forwarded instead of dropped.
     """
     if not controller.setup_sent:
         await provider.connect()
-        for message in controller.plan.setup_messages:
+        for message in messages_before_opener(
+            controller.plan,
+            hold_opener=controller.opener_wait_for_speech,
+        ):
             await provider.send(message)
         controller.setup_sent = True
         logger.info("Sent realtime session for call %s", controller.call_id)
@@ -1074,6 +1204,9 @@ async def run_relay(
     async def watchdog() -> None:
         while True:
             await asyncio.sleep(0.05)
+            opener = controller.poll_opener()
+            if opener is not None:
+                await dispatch(opener)
             deadline = controller.hangup_deadline
             if (
                 deadline is not None

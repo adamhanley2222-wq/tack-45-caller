@@ -56,6 +56,12 @@ class Settings(BaseSettings):
 
     prompt_path: str = "prompts/system.txt"
     opener_path: str = "prompts/compliance_opener.txt"
+    # Outbound only. The session still opens immediately. The opener waits
+    # until the person called has spoken and then been quiet, or until the
+    # max wait if they never speak. Inbound calls ignore this.
+    opener_wait_for_speech: bool = True
+    opener_silence_ms: int = 500
+    opener_max_wait_ms: int = 2500
     inbound_prompt_path: str = "prompts/inbound_system.txt"
     briefs_dir: str = "prompts/briefs"
     # How far back an inbound caller is matched to an outbound call. 0 keeps all.

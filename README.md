@@ -102,6 +102,8 @@ Grok and OpenAI Realtime both request `audio/pcmu` in and out, `server_vad`, and
 
 The opener in `prompts/compliance_opener.txt` is only `Hi, is this {first name}?`. The first name is the first word of the call's `name`. With no name it is `Hi, is that the business owner?`. The model waits. On a confirmation, the next turn must be the AI disclosure and the Tack45 identification before any pitch. A wrong person gets that identification and a request to reach the right person or a callback time, and no pitch. A no to the chat asks about removing the number. Any opt-out, at any time, calls `record_opt_out` and then `end_call`.
 
+On an outbound call the realtime session is still opened as soon as the media stream connects, for Grok, OpenAI, GPT-Live, and Gemini Live. The opener itself waits. Incoming μ-law is checked with an energy gate so line noise does not count. After the person called has spoken and then been quiet for `OPENER_SILENCE_MS` (default 500), the opener is the first thing the assistant says. If no speech is heard within `OPENER_MAX_WAIT_MS` (default 2500) of the stream starting, the opener plays anyway. Audio from that wait is not forwarded, so it cannot start a reply of its own. The decision is logged: triggered by speech after N ms, or by the timeout. `OPENER_WAIT_FOR_SPEECH=false` speaks as soon as the stream connects. Inbound calls do not wait. For GPT-Live the greeting is left out of `session.start` during the wait and sent afterwards with `session.commentary.append`, once `session.started` has arrived. Gemini Live sends its opener client turn at that same moment instead of on `setupComplete`.
+
 The system prompt is `prompts/system.txt`. Replace the placeholder sales section when the real script is ready, and keep the accent, disclosure, opt-out, and `end_call` rules. The accent line asks for a male Australian voice with a calm, clear, ABC-newsreader-style General Australian accent.
 
 Barge-in is suppressed while the opener is still playing, so the disclosure is not cut off. After that, caller speech sends Twilio `{"event":"clear"}` and drops queued μ-law. When the model calls `end_call`, the relay waits until Twilio echoes a mark (playback finished), then `POST`s `Status=completed` on the call. A watchdog hangs up if the mark never returns.
@@ -246,6 +248,9 @@ When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The 
 | `DEFAULT_TIMEZONE` | no | Default `Australia/Sydney` |
 | `PROMPT_PATH` | no | Default `prompts/system.txt` |
 | `OPENER_PATH` | no | Default `prompts/compliance_opener.txt` |
+| `OPENER_WAIT_FOR_SPEECH` | no | Default `true`. Outbound opener waits for the callee to speak, then a short silence. Inbound is unchanged |
+| `OPENER_SILENCE_MS` | no | Quiet time after speech before the opener. Default 500 |
+| `OPENER_MAX_WAIT_MS` | no | Play the opener if nobody speaks. Default 2500, from when the stream starts |
 | `INBOUND_PROMPT_PATH` | no | Default `prompts/inbound_system.txt` |
 | `INBOUND_LOOKUP_DAYS` | no | Match a caller to an outbound call from the last N days. Default 90. `0` keeps all |
 | `MACHINE_MESSAGE` | no | Empty hangs up on machines. Otherwise spoken, then hangup |

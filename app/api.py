@@ -19,7 +19,7 @@ from app.briefs import BriefError, apply_brief, resolve_brief
 from app.prompts import first_name_from, inbound_opener, load_text, render_instructions, render_opener
 from app.providers import SessionPlan, build_session_plan
 from app.realtime_ws import default_provider_factory
-from app.relay import RelayController, run_relay
+from app.relay import RelayController, messages_before_opener, run_relay
 from app.signatures import signature_is_valid
 from app.transcript_webhook import schedule_transcript_webhook
 from app.twiml import (
@@ -133,6 +133,13 @@ async def script_for_call(settings: Settings, db, call: dict) -> tuple[str, Sess
             )
         return prepare_inbound_script(settings, call, match)
     return prepare_script(settings, call)
+
+
+def _hold_opener(settings: Settings, call: dict) -> bool:
+    """Outbound calls wait for hello. Inbound callers are already on the line."""
+    if not settings.opener_wait_for_speech:
+        return False
+    return (call.get("direction") or "outbound") != "inbound"
 
 
 def relay_phone(call: dict) -> str:
@@ -501,6 +508,7 @@ async def media_stream(websocket: WebSocket, token: str) -> None:
     controller = None
     if plan.provider != "gemini":
         provider, setup_sent = await _take_provider(websocket.app, settings, call, plan)
+        hold_opener = _hold_opener(settings, call)
         controller = RelayController(
             call_id=call["id"],
             call_sid=call["call_sid"],
@@ -509,6 +517,9 @@ async def media_stream(websocket: WebSocket, token: str) -> None:
             plan=plan,
             hangup_grace_seconds=settings.hangup_grace_seconds,
             setup_sent=setup_sent,
+            opener_wait_for_speech=hold_opener,
+            opener_silence_ms=settings.opener_silence_ms,
+            opener_max_wait_ms=settings.opener_max_wait_ms,
         )
     try:
         await websocket.app.state.db.mark_stream_open(call["id"])
@@ -685,7 +696,11 @@ async def _prewarm_session(request: Request, call: dict) -> None:
     try:
         factory = getattr(request.app.state, "provider_factory", default_provider_factory)
         provider = factory(settings, call)
-        await request.app.state.prewarm.start(call["id"], provider, plan.setup_messages)
+        await request.app.state.prewarm.start(
+            call["id"],
+            provider,
+            messages_before_opener(plan, hold_opener=_hold_opener(settings, call)),
+        )
         # Let the handshake task reach its first await. Do not wait for it.
         await asyncio.sleep(0)
     except Exception:
