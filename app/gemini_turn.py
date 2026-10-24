@@ -460,6 +460,7 @@ class GeminiController:
         instructions: str,
         hangup_grace_seconds: float = 8.0,
         clock=time.monotonic,
+        utterance_prefix: str = "gemini",
     ) -> None:
         self.call_id = call_id
         self.call_sid = call_sid
@@ -468,6 +469,7 @@ class GeminiController:
         self.instructions = instructions
         self.hangup_grace_seconds = hangup_grace_seconds
         self.clock = clock
+        self.utterance_prefix = utterance_prefix or "gemini"
 
         self.stream_sid: str | None = None
         self.started = False
@@ -793,7 +795,7 @@ class GeminiController:
             "role": role,
             "text": cleaned,
             "at": datetime.now(timezone.utc).isoformat(),
-            "utterance_id": f"gemini-{self._partial_seq}",
+            "utterance_id": f"{self.utterance_prefix}-{self._partial_seq}",
         }
         self.transcript.append(line)
         return line

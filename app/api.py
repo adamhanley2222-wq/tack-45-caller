@@ -499,7 +499,7 @@ async def media_stream(websocket: WebSocket, token: str) -> None:
         return
     provider = None
     controller = None
-    if plan.provider != "gemini":
+    if plan.provider not in {"gemini", "pipeline"}:
         provider, setup_sent = await _take_provider(websocket.app, settings, call, plan)
         controller = RelayController(
             call_id=call["id"],
@@ -512,7 +512,19 @@ async def media_stream(websocket: WebSocket, token: str) -> None:
         )
     try:
         await websocket.app.state.db.mark_stream_open(call["id"])
-        if plan.provider == "gemini":
+        if plan.provider == "pipeline":
+            from app.pipeline import run_pipeline_call
+
+            await run_pipeline_call(
+                websocket=websocket,
+                settings=settings,
+                call=call,
+                plan=plan,
+                store=websocket.app.state.db,
+                gateway=websocket.app.state.gateway,
+                phone=relay_phone(call),
+            )
+        elif plan.provider == "gemini":
             from app.gemini_cascade import gemini_cache, run_gemini_call
 
             await run_gemini_call(
@@ -681,6 +693,11 @@ async def _prewarm_session(request: Request, call: dict) -> None:
         from app.gemini_cascade import schedule_gemini_prewarm
 
         schedule_gemini_prewarm(request.app, settings, _opener)
+        return
+    if plan.provider == "pipeline":
+        from app.pipeline import schedule_pipeline_auth
+
+        schedule_pipeline_auth(request.app, settings)
         return
     try:
         factory = getattr(request.app.state, "provider_factory", default_provider_factory)

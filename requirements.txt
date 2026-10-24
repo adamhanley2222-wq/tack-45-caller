@@ -13,3 +13,4 @@ pytest-asyncio>=0.24
 tzdata>=2024.2
 google-auth>=2.35
 google-cloud-texttospeech>=2.31
+google-cloud-speech>=2.31
