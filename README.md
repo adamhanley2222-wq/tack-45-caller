@@ -21,6 +21,8 @@ phone  <->  Twilio Media Streams (audio/pcmu, 8 kHz)
                         <->  wss://api.x.ai/v1/realtime   (VOICE_PROVIDER=grok)
                         <->  wss://api.openai.com/v1/realtime  (VOICE_PROVIDER=openai)
                         <->  wss://api.openai.com/v1/live/sessions  (VOICE_PROVIDER=gptlive)
+                        <->  Deepgram listen + Gemini text + Gemini TTS
+                             (VOICE_PROVIDER=gemini, still μ-law 8 kHz)
 ```
 
 ## Run locally
@@ -90,7 +92,7 @@ Area codes `02`, `03`, and `07` select Sydney, Melbourne, and Brisbane. Mobiles 
 
 ## Voice providers
 
-`VOICE_PROVIDER=grok` (default), `openai`, or `gptlive`.
+`VOICE_PROVIDER=grok` (default), `openai`, `gptlive`, or `gemini`.
 
 Grok and OpenAI Realtime both request `audio/pcmu` in and out, `server_vad`, and the tools `end_call` and `record_opt_out`. Grok also enables `grok-transcribe` on input and, unless `USE_FORCE_MESSAGE=false`, speaks the opener with xAI `force_message` (verbatim TTS, not a model-written line). OpenAI has no `force_message`; the opener is requested with `response.create` instructions. See the [xAI voice agent guide](https://docs.x.ai/docs/guides/voice/agent) and the [phone cookbook](https://docs.x.ai/cookbook/examples/voice-agent-phone).
 
@@ -101,6 +103,52 @@ The opener in `prompts/compliance_opener.txt` is only `Hi, is this {first name}?
 The system prompt is `prompts/system.txt`. Replace the placeholder sales section when the real script is ready, and keep the accent, disclosure, opt-out, and `end_call` rules. The accent line asks for a male Australian voice with a calm, clear, ABC-newsreader-style General Australian accent.
 
 Barge-in is suppressed while the opener is still playing, so the disclosure is not cut off. After that, caller speech sends Twilio `{"event":"clear"}` and drops queued μ-law. When the model calls `end_call`, the relay waits until Twilio echoes a mark (playback finished), then `POST`s `Status=completed` on the call. A watchdog hangs up if the mark never returns.
+
+### Gemini cascade
+
+`VOICE_PROVIDER=gemini` does not open a realtime speech-to-speech socket. Grok, OpenAI, and GPT-Live are unchanged. The same prompt assembly is used (`prompts/system.txt`, an optional `prompts/briefs/<id>.md`, and the call notes), and the same tools run: `end_call` and `record_opt_out`. Opt-out is written as soon as the tool call arrives, before the goodbye finishes playing. Calling hours, the do-not-call list, transcripts, and the finished-call webhook are the same code paths as the other providers.
+
+Audio stays 8 kHz G.711 μ-law. Nothing is resampled.
+
+* Listener: Deepgram streaming STT for the whole call (`DEEPGRAM_API_KEY`), μ-law 8 kHz, `language=en-AU`, `vad_events` and `endpointing` (default 400 ms). `SpeechStarted` is barge-in. `speech_final` ends the turn.
+* Speaker: Gemini text (`GEMINI_TEXT_MODEL`, default `gemini-2.5-flash`) streamed into `gemini-3.8-flash-lite-tts`. Voice `Charon`. The accent is only the speech-style metadata `Australian English accent, relaxed and friendly`. Language is `en-AU` on the speech config. Neither is written into the words that are spoken. The request is the same Interactions body as `POST /probe/tts`.
+* Controller: the opener and a few fixed lines (backchannels, the opt-out confirmation, a polite goodbye) are pre-rendered and cached. A short backchannel plays when the caller finishes a turn, covering the wait for the first real sentence. The first sentence is kept short. The next sentence is sent to TTS while the current one is still playing. Barge-in sends Twilio `clear` and stops TTS, except during the protected opener.
+
+Measured TTS latency on this path is about 480 ms to the first audio byte and about 1.0 s for a whole sentence. After the caller stops, expect about 400 ms of endpointing, then a cached backchannel immediately, then the first real sentence once the text model has a short clause (a few hundred milliseconds) plus that 480 ms. Later sentences overlap synthesis with playback, so the gap between them is mostly hidden when a sentence plays for about a second.
+
+Gemini API Tier 1 is 10 requests per minute and 100 per day. That is too low for production. Each uncached sentence is one TTS request, and each caller turn is one text request. A fresh process also spends a handful of requests pre-rendering the opener and the fixed lines; those clips are reused until the process restarts. A short call is on the order of 10–20 Gemini requests. Two calls close together can trip the per-minute cap. A 429 is logged and the caller hears one cached line — "Sorry, I'm having trouble on my side. I'll leave it there. Goodbye." — then the call ends. There is no retry loop. Raise the quota before pointing a live number at this provider. The default provider is still `grok`, so deploying this code does not switch traffic until `VOICE_PROVIDER=gemini`.
+
+Cost, using published rates (check the vendor pages before a campaign; promotions move):
+
+| Piece | Rate | A short call (about 3 minutes, under a minute of assistant speech) |
+| --- | --- | --- |
+| Deepgram Nova-3 monolingual streaming | $0.0048/min promotional, $0.0077/min regular | about 1–2 cents |
+| Gemini 2.5 Flash text | $0.30 / 1M input tokens, $2.50 / 1M output tokens | well under 1 cent |
+| Gemini 3.8 Flash-Lite TTS through 31 Dec 2026 | $0.50 / 1M text tokens in, $6 / 1M audio tokens out (25 audio tokens/second, about $0.0015 per 10 seconds) | about 1 cent |
+| Same TTS from 1 Jan 2027 | input and output prices double | about 2 cents |
+
+The dollar cost of one test call is a few cents. The daily request cap is what runs out first.
+
+Try the logic with no credentials and no dial:
+
+```bash
+python scripts/simulate_gemini.py
+```
+
+That runs barge-in, overlapping sentence synthesis, immediate opt-out, and the 429 fallback against fakes.
+
+One real call, only after the quota is raised, to a number you control, during calling hours. Do not change the Twilio number. From a shell with the service already running:
+
+```bash
+VOICE_PROVIDER=gemini GEMINI_API_KEY=... DEEPGRAM_API_KEY=... \
+CALLER_BASE_URL=http://127.0.0.1:8787 API_BEARER_TOKEN=your-token \
+  python scripts/place_call.py \
+  --to +61412345678 \
+  --name "Sam Lee" \
+  --business "Harbour Roasters"
+```
+
+Use your own mobile, not a guessed number. `POST /probe/tts` still measures TTS latency without dialling. Set `GEMINI_THINKING_BUDGET=-1` if the text model rejects `thinkingConfig`. `GEMINI_THINKING_BUDGET=0` (the default) skips thinking on models that accept it, which matters on a phone call.
 
 ## Storage
 
@@ -120,7 +168,7 @@ When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The 
 | `TWILIO_API_KEY_SID` | yes | API key sid (`SK...`), used as HTTP basic auth username |
 | `TWILIO_API_KEY_SECRET` | yes | API key secret |
 | `TWILIO_FROM_NUMBER` | yes | Caller ID. Use `+61290904464` |
-| `VOICE_PROVIDER` | yes | `grok` (default), `openai`, or `gptlive` |
+| `VOICE_PROVIDER` | yes | `grok` (default), `openai`, `gptlive`, or `gemini` |
 | `XAI_API_KEY` | when provider is grok | xAI key for `wss://api.x.ai/v1/realtime` |
 | `OPENAI_API_KEY` | when provider is openai or gptlive | OpenAI key for Realtime or GPT-Live |
 | `TWILIO_AUTH_TOKEN` | no | When set, webhooks must carry a valid `X-Twilio-Signature` |
@@ -152,7 +200,18 @@ When `TRANSCRIPT_WEBHOOK_URL` is set, a finished call is POSTed there once. The 
 | `MACHINE_DETECTION_TIMEOUT` | no | Twilio `MachineDetectionTimeout`. Default 30 |
 | `HANGUP_GRACE_SECONDS` | no | Extra wait after playback before the hangup watchdog. Default 8 |
 | `LOG_LEVEL` | no | Default `INFO` |
-| `GEMINI_API_KEY` | no | Admin `POST /probe/tts` only. Calls do not use it |
+| `GEMINI_API_KEY` | when provider is gemini | Text model and TTS. Also the admin `POST /probe/tts` key. Grok, OpenAI, and GPT-Live do not read it |
+| `DEEPGRAM_API_KEY` | when provider is gemini | Streaming speech-to-text for the caller |
+| `DEEPGRAM_URL` | no | Default `wss://api.deepgram.com/v1/listen` |
+| `DEEPGRAM_MODEL` | no | Default `nova-3` |
+| `DEEPGRAM_LANGUAGE` | no | Default `en-AU` |
+| `DEEPGRAM_ENDPOINTING_MS` | no | Silence before a caller turn ends. Default 400 |
+| `GEMINI_TEXT_MODEL` | no | Default `gemini-2.5-flash` |
+| `GEMINI_TTS_MODEL` | no | Default `gemini-3.8-flash-lite-tts` |
+| `GEMINI_TTS_VOICE` | no | Default `Charon` |
+| `GEMINI_TTS_STYLE` | no | Speech metadata only. Default `Australian English accent, relaxed and friendly` |
+| `GEMINI_TTS_LANGUAGE` | no | Default `en-AU` |
+| `GEMINI_THINKING_BUDGET` | no | Default `0`. `-1` omits `thinkingConfig` |
 | `TRANSCRIPT_WEBHOOK_URL` | no | Where to POST each finished call. Empty disables the feature |
 | `TRANSCRIPT_WEBHOOK_SECRET` | no | Secret sent with that POST. Empty sends no auth header |
 | `TRANSCRIPT_WEBHOOK_AUTH_HEADER` | no | Header name for the secret. Default `Authorization`, which sends `Bearer <secret>`. Any other name sends the raw secret |
@@ -192,6 +251,8 @@ Set `TWILIO_AUTH_TOKEN` (the account auth token, not the API key) if you want we
 The body may set `sentences`, `runs_per_sentence` (default 1), `style`, `voice`, `model`, and `save_samples` (default 3). Omitted sentences are about twenty short Tack45 lines. Each request is `gemini-3.8-flash-lite-tts` on the Interactions API with `stream: true`, μ-law at 8 kHz, and the style `Australian English accent, relaxed and friendly` unless overridden. The voice goes in `generation_config.speech_config` and defaults to `Kore`.
 
 The JSON reports time to first audio byte and total time for each run, p50/p90/min/max, audio bytes and seconds, and `RAILWAY_REPLICA_REGION` when that environment variable is set. Up to `save_samples` clips are returned as base64 μ-law and kept in memory for `GET /probe/tts/sample/{n}.wav`.
+
+`VOICE_PROVIDER=gemini` reuses this request builder. The call path passes voice `Charon` and language `en-AU` instead of the probe default `Kore`.
 
 ## Deploy on Railway
 

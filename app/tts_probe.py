@@ -71,8 +71,23 @@ def server_region() -> str | None:
     return None
 
 
-def interaction_body(text: str, *, model: str, style: str, voice: str) -> dict[str, Any]:
-    """One Interactions API speech request. Voice is the documented speech_config array."""
+def interaction_body(
+    text: str,
+    *,
+    model: str,
+    style: str,
+    voice: str,
+    language: str | None = None,
+) -> dict[str, Any]:
+    """One Interactions API speech request. Voice is the documented speech_config array.
+
+    ``style`` is speech metadata and is not part of the spoken transcript.
+    ``language`` is the SpeechConfig language (for example ``en-AU``). Omit it
+    and the body matches the original probe request.
+    """
+    speech: dict[str, Any] = {"voice": voice}
+    if language:
+        speech["language"] = language
     return {
         "model": model,
         "store": False,
@@ -99,9 +114,7 @@ def interaction_body(text: str, *, model: str, style: str, voice: str) -> dict[s
             "sample_rate": SAMPLE_RATE,
         },
         "generation_config": {
-            "speech_config": [
-                {"voice": voice},
-            ]
+            "speech_config": [speech],
         },
         "stream": True,
     }

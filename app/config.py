@@ -69,8 +69,22 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
-    # Optional. Used only by POST /probe/tts. Calls do not read it.
+    # POST /probe/tts, and the text model plus TTS when VOICE_PROVIDER=gemini.
     gemini_api_key: str = ""
+    # Cascaded Gemini provider. Ignored unless VOICE_PROVIDER=gemini.
+    deepgram_api_key: str = ""
+    deepgram_url: str = "wss://api.deepgram.com/v1/listen"
+    deepgram_model: str = "nova-3"
+    deepgram_language: str = "en-AU"
+    # Silence, in milliseconds, before Deepgram ends a caller turn.
+    deepgram_endpointing_ms: int = 400
+    gemini_text_model: str = "gemini-2.5-flash"
+    gemini_tts_model: str = "gemini-3.8-flash-lite-tts"
+    gemini_tts_voice: str = "Charon"
+    gemini_tts_style: str = "Australian English accent, relaxed and friendly"
+    gemini_tts_language: str = "en-AU"
+    # 0 disables thinking on models that accept thinkingConfig. -1 omits the field.
+    gemini_thinking_budget: int = 0
 
     # Empty disables the finished-call webhook.
     transcript_webhook_url: str = ""
@@ -100,6 +114,11 @@ def missing_dial_configuration(settings: Settings) -> list[str]:
         missing.append("OPENAI_API_KEY")
     elif provider == "gptlive" and not settings.openai_api_key:
         missing.append("OPENAI_API_KEY")
-    elif provider not in {"grok", "openai", "gptlive"}:
+    elif provider == "gemini":
+        if not settings.gemini_api_key:
+            missing.append("GEMINI_API_KEY")
+        if not settings.deepgram_api_key:
+            missing.append("DEEPGRAM_API_KEY")
+    elif provider not in {"grok", "openai", "gptlive", "gemini"}:
         missing.append("VOICE_PROVIDER")
     return missing

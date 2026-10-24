@@ -497,25 +497,42 @@ async def media_stream(websocket: WebSocket, token: str) -> None:
         await _release_stream(websocket.app, call["id"])
         await websocket.close(code=1011)
         return
-    provider, setup_sent = await _take_provider(websocket.app, settings, call, plan)
-    controller = RelayController(
-        call_id=call["id"],
-        call_sid=call["call_sid"],
-        phone=relay_phone(call),
-        opener=opener,
-        plan=plan,
-        hangup_grace_seconds=settings.hangup_grace_seconds,
-        setup_sent=setup_sent,
-    )
+    provider = None
+    controller = None
+    if plan.provider != "gemini":
+        provider, setup_sent = await _take_provider(websocket.app, settings, call, plan)
+        controller = RelayController(
+            call_id=call["id"],
+            call_sid=call["call_sid"],
+            phone=relay_phone(call),
+            opener=opener,
+            plan=plan,
+            hangup_grace_seconds=settings.hangup_grace_seconds,
+            setup_sent=setup_sent,
+        )
     try:
         await websocket.app.state.db.mark_stream_open(call["id"])
-        await run_relay(
-            twilio_ws=websocket,
-            provider=provider,
-            controller=controller,
-            store=websocket.app.state.db,
-            gateway=websocket.app.state.gateway,
-        )
+        if plan.provider == "gemini":
+            from app.gemini_cascade import gemini_cache, run_gemini_call
+
+            await run_gemini_call(
+                websocket=websocket,
+                settings=settings,
+                call=call,
+                plan=plan,
+                store=websocket.app.state.db,
+                gateway=websocket.app.state.gateway,
+                phone=relay_phone(call),
+                cache=gemini_cache(websocket.app),
+            )
+        else:
+            await run_relay(
+                twilio_ws=websocket,
+                provider=provider,
+                controller=controller,
+                store=websocket.app.state.db,
+                gateway=websocket.app.state.gateway,
+            )
     except Exception:
         logger.exception("Media relay ended with an error for %s", call["id"])
         await websocket.close(code=1011)
@@ -659,6 +676,11 @@ async def _prewarm_session(request: Request, call: dict) -> None:
         _opener, plan = await script_for_call(settings, request.app.state.db, call)
     except FileNotFoundError:
         logger.exception("Prompt file missing; the stream will open the session itself.")
+        return
+    if plan.provider == "gemini":
+        from app.gemini_cascade import schedule_gemini_prewarm
+
+        schedule_gemini_prewarm(request.app, settings, _opener)
         return
     try:
         factory = getattr(request.app.state, "provider_factory", default_provider_factory)
