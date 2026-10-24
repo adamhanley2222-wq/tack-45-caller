@@ -11,3 +11,5 @@ holidays>=0.60
 pytest>=8.3
 pytest-asyncio>=0.24
 tzdata>=2024.2
+google-auth>=2.35
+google-cloud-texttospeech>=2.31

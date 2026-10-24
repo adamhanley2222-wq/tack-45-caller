@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -73,6 +74,10 @@ class Settings(BaseSettings):
     # (VOICE_PROVIDER=geminilive). Grok, OpenAI, and GPT-Live do not read it.
     gemini_api_key: str = ""
     # POST /probe/tts with provider "cloudtts" only. Calls do not read it.
+    # Preferred credential: the full service-account JSON key. Not logged.
+    google_tts_credentials_json: str = Field(default="", repr=False)
+    # Fallback only when GOOGLE_TTS_CREDENTIALS_JSON is empty.
+    # Chirp 3 HD rejects API keys with 401.
     google_tts_api_key: str = ""
     # Cascaded Gemini provider. Ignored unless VOICE_PROVIDER=gemini.
     deepgram_api_key: str = ""

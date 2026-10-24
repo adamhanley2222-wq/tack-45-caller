@@ -4,17 +4,27 @@ Gemini Flash-Lite is the default. ``provider: "cloudtts"`` measures Google
 Cloud Text-to-Speech Chirp 3 HD instead. This does not dial, open a voice
 session, or change call configuration. Audio is 8 kHz G.711 μ-law, the same
 codec Twilio media uses.
+
+Cloud TTS prefers a service account in ``GOOGLE_TTS_CREDENTIALS_JSON``. The
+probe mints an OAuth access token (cloud-platform scope), caches it, and
+refreshes it when it expires. ``GOOGLE_TTS_API_KEY`` is only a fallback.
+``streaming: true`` also measures gRPC StreamingSynthesize and reports time
+to first audio for both methods. Credentials and tokens are not logged.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
+import re
 import struct
+import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -36,8 +46,18 @@ DEFAULT_VOICE = "Kore"
 SAMPLE_RATE = 8000
 CLOUD_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 CLOUD_TTS_METHOD = "text:synthesize"
+CLOUD_TTS_STREAM_METHOD = "streaming_synthesize"
 CLOUD_TTS_VOICE = "en-AU-Chirp3-HD-Charon"
 CLOUD_TTS_LANGUAGE = "en-AU"
+CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+_ACCESS_TOKEN_RE = re.compile(r"ya29\.[A-Za-z0-9_\-.]+")
+_auth_lock = threading.Lock()
+_auth_cache: dict[str, Any] = {}
+_clients: dict[int, Any] = {}
 GEMINI_METHOD = "interactions"
 MAX_SENTENCES = 40
 MAX_RUNS = 5
@@ -334,10 +354,124 @@ def _now() -> float:
     return time.monotonic()
 
 
-def _redact(text: str, secret: str) -> str:
-    if secret:
-        text = text.replace(secret, "[redacted]")
-    return text[:500]
+def _redact(text: str, *secrets: str) -> str:
+    """Strip private keys, access tokens, and any other secret values."""
+    cleaned = _PRIVATE_KEY_RE.sub("[redacted]", text)
+    cleaned = _ACCESS_TOKEN_RE.sub("[redacted]", cleaned)
+    pieces: list[str] = []
+    for secret in secrets:
+        if not secret:
+            continue
+        pieces.append(secret)
+        pieces.extend(line.strip() for line in secret.splitlines() if len(line.strip()) >= 12)
+    for piece in sorted(set(pieces), key=len, reverse=True):
+        cleaned = cleaned.replace(piece, "[redacted]")
+    return cleaned[:500]
+
+
+def reset_cloudtts_auth_cache() -> None:
+    """Drop cached service-account credentials and speech clients. Tests use this."""
+    with _auth_lock:
+        _auth_cache.clear()
+        _clients.clear()
+
+
+def _credential_secrets(raw: str, *extra: str) -> list[str]:
+    found = [raw, *extra]
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        info = None
+    if isinstance(info, dict):
+        for key in ("private_key", "private_key_id", "client_email", "client_id", "token_uri"):
+            value = info.get(key)
+            if isinstance(value, str) and value:
+                found.append(value)
+    return [item for item in found if item]
+
+
+def _needs_refresh(credentials: Any) -> bool:
+    """True when the access token is missing, expired, or inside the refresh window."""
+    from google.auth.credentials import TokenState
+
+    state = getattr(credentials, "token_state", None)
+    if state is None:
+        return not bool(getattr(credentials, "valid", False))
+    return state != TokenState.FRESH
+
+
+def _service_account_credentials(info: dict[str, Any]) -> Any:
+    from google.oauth2 import service_account
+
+    return service_account.Credentials.from_service_account_info(
+        info,
+        scopes=[CLOUD_PLATFORM_SCOPE],
+    )
+
+
+def _auth_request() -> Any:
+    from google.auth.transport.requests import Request
+
+    return Request()
+
+
+def _build_credentials(raw: str) -> Any:
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        raise APIError(
+            400,
+            "not_configured",
+            "GOOGLE_TTS_CREDENTIALS_JSON is not valid JSON.",
+        ) from None
+    if not isinstance(info, dict):
+        raise APIError(
+            400,
+            "not_configured",
+            "GOOGLE_TTS_CREDENTIALS_JSON is not a service account key.",
+        )
+    try:
+        return _service_account_credentials(info)
+    except Exception:
+        raise APIError(
+            400,
+            "not_configured",
+            "GOOGLE_TTS_CREDENTIALS_JSON is not a service account key.",
+        ) from None
+
+
+def cloudtts_credentials(raw: str) -> Any:
+    """Cached service-account credentials with a usable access token.
+
+    Refresh runs only when the token is missing, expired, or inside
+    google-auth's refresh window. The JSON and the token are not logged.
+    """
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    secrets = _credential_secrets(raw)
+    with _auth_lock:
+        credentials = _auth_cache.get(digest)
+        if credentials is None:
+            credentials = _build_credentials(raw)
+            _auth_cache[digest] = credentials
+        if _needs_refresh(credentials):
+            token = getattr(credentials, "token", None) or ""
+            try:
+                credentials.refresh(_auth_request())
+            except Exception as exc:
+                message = _redact(
+                    f"Cloud TTS service account token refresh failed: {exc}",
+                    *secrets,
+                    token if isinstance(token, str) else "",
+                )
+                raise APIError(400, "not_configured", message) from None
+            refreshed = getattr(credentials, "token", None)
+            if not isinstance(refreshed, str) or not refreshed:
+                raise APIError(
+                    400,
+                    "not_configured",
+                    "Cloud TTS service account did not return an access token.",
+                )
+        return credentials
 
 
 def _parse_probe_body(payload: Any) -> dict[str, Any]:
@@ -377,6 +511,9 @@ def _parse_probe_body(payload: Any) -> dict[str, Any]:
         raise APIError(422, "invalid_body", "voice must be a non-empty string.")
     if not isinstance(model, str) or not model.strip():
         raise APIError(422, "invalid_body", "model must be a non-empty string.")
+    streaming = payload.get("streaming", False)
+    if not isinstance(streaming, bool):
+        raise APIError(422, "invalid_body", "streaming must be a boolean.")
     return {
         "provider": provider,
         "sentences": chosen,
@@ -385,6 +522,7 @@ def _parse_probe_body(payload: Any) -> dict[str, Any]:
         "style": style.strip(),
         "voice": voice.strip(),
         "model": model.strip(),
+        "streaming": streaming,
     }
 
 
@@ -442,28 +580,33 @@ async def synthesize(
 
 
 async def synthesize_cloudtts(
-    api_key: str,
     body: dict[str, Any],
     *,
+    token: str = "",
+    api_key: str = "",
+    secrets: list[str] | None = None,
     clock: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
     """POST one unary text:synthesize. The clock is read immediately before send.
 
-    StreamingSynthesize is not used: it is a bidirectional gRPC method whose
-    documented auth is an OAuth token, and it is not in the REST discovery
-    document. The key is sent as a header so it is not written into the URL.
+    A service-account access token is sent as ``Authorization: Bearer``.
+    ``X-Goog-Api-Key`` is sent only when no token was minted. Neither value
+    is written into the URL or into logs.
     """
     tick = clock or _now
+    hidden = [item for item in (token, api_key, *(secrets or [])) if item]
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    elif api_key:
+        headers["X-Goog-Api-Key"] = api_key
     start = tick()
     conversion_ms = 0.0
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 CLOUD_TTS_URL,
-                headers={
-                    "X-Goog-Api-Key": api_key,
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json=body,
             )
     except httpx.HTTPError as exc:
@@ -473,10 +616,10 @@ async def synthesize_cloudtts(
             "total_ms": (end - start) * 1000,
             "conversion_ms": 0.0,
             "audio": b"",
-            "error": _redact(str(exc), api_key),
+            "error": _redact(str(exc), *hidden),
         }
     if response.status_code >= 400:
-        raw = _redact(response.text, api_key)
+        raw = _redact(response.text, *hidden)
         end = tick()
         return {
             "ttfa_ms": None,
@@ -533,6 +676,184 @@ async def synthesize_cloudtts(
     }
 
 
+def _audio_chunk(value: Any) -> bytes:
+    if not value:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    try:
+        converted = bytes(value)
+    except (TypeError, ValueError):
+        return b""
+    return converted
+
+
+def _text_to_speech_client(credentials: Any) -> Any:
+    """One gRPC client per credentials object, reused across probe runs."""
+    key = id(credentials)
+    with _auth_lock:
+        cached = _clients.get(key)
+        if cached is not None:
+            return cached
+    from google.cloud import texttospeech
+
+    client = texttospeech.TextToSpeechClient(credentials=credentials)
+    with _auth_lock:
+        existing = _clients.get(key)
+        if existing is not None:
+            return existing
+        _clients[key] = client
+        return client
+
+
+def _streaming_requests(text: str, voice: str) -> tuple[Any, Any]:
+    """Config frame, then the sentence. Chirp 3 HD, μ-law at 8 kHz, en-AU."""
+    from google.cloud import texttospeech
+
+    config = texttospeech.StreamingSynthesizeRequest(
+        streaming_config=texttospeech.StreamingSynthesizeConfig(
+            voice=texttospeech.VoiceSelectionParams(
+                language_code=CLOUD_TTS_LANGUAGE,
+                name=voice,
+            ),
+            streaming_audio_config=texttospeech.StreamingAudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.MULAW,
+                sample_rate_hertz=SAMPLE_RATE,
+            ),
+        )
+    )
+    audio_input = texttospeech.StreamingSynthesizeRequest(
+        input=texttospeech.StreamingSynthesisInput(text=text)
+    )
+    return config, audio_input
+
+
+def synthesize_cloudtts_streaming(
+    credentials: Any,
+    text: str,
+    voice: str,
+    secrets: list[str] | None = None,
+) -> dict[str, Any]:
+    """One bidirectional StreamingSynthesize call.
+
+    The clock starts immediately before the RPC. Time to first audio is the
+    first non-empty ``audio_content`` chunk. Total time ends once that audio
+    is 8 kHz μ-law. Conversion is timed on its own.
+    """
+    hidden = list(secrets or [])
+    token = getattr(credentials, "token", None)
+    if isinstance(token, str) and token and token not in hidden:
+        hidden.append(token)
+    try:
+        client = _text_to_speech_client(credentials)
+        requests = _streaming_requests(text, voice)
+    except Exception as exc:
+        return {
+            "ttfa_ms": None,
+            "total_ms": 0.0,
+            "conversion_ms": 0.0,
+            "audio": b"",
+            "error": _redact(f"Cloud TTS stream could not start: {exc}", *hidden),
+        }
+    start = _now()
+    first: float | None = None
+    chunks: list[bytes] = []
+    try:
+        for response in client.streaming_synthesize(iter(requests)):
+            chunk = _audio_chunk(getattr(response, "audio_content", b""))
+            if not chunk:
+                continue
+            if first is None:
+                first = _now()
+            chunks.append(chunk)
+    except Exception as exc:
+        end = _now()
+        return {
+            "ttfa_ms": None if first is None else (first - start) * 1000,
+            "total_ms": (end - start) * 1000,
+            "conversion_ms": 0.0,
+            "audio": b"",
+            "error": _redact(f"Cloud TTS stream failed: {exc}", *hidden),
+        }
+    audio, conversion_ms, convert_error = mulaw_from_cloud_audio(b"".join(chunks), _now)
+    end = _now()
+    if convert_error:
+        audio = b""
+    elif not audio:
+        convert_error = "Cloud TTS stream contained no audio."
+    return {
+        "ttfa_ms": None if first is None or convert_error else (first - start) * 1000,
+        "total_ms": (end - start) * 1000,
+        "conversion_ms": conversion_ms,
+        "audio": audio,
+        "error": convert_error,
+    }
+
+
+async def _collect_runs(
+    sentences: list[str],
+    runs_per_sentence: int,
+    save_samples: int,
+    synthesize_one: Callable[[str], Awaitable[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[float], list[float], list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    ttfa_values: list[float] = []
+    total_values: list[float] = []
+    clips: list[dict[str, Any]] = []
+    for sentence in sentences:
+        runs: list[dict[str, Any]] = []
+        for _ in range(runs_per_sentence):
+            result = await synthesize_one(sentence)
+            audio: bytes = result["audio"]
+            runs.append(
+                {
+                    "ttfa_ms": result["ttfa_ms"],
+                    "total_ms": result["total_ms"],
+                    "conversion_ms": result.get("conversion_ms", 0.0),
+                    "audio_bytes": len(audio),
+                    "audio_seconds": len(audio) / SAMPLE_RATE,
+                    "error": result["error"],
+                }
+            )
+            if result["ttfa_ms"] is not None and result["error"] is None:
+                ttfa_values.append(result["ttfa_ms"])
+                total_values.append(result["total_ms"])
+            if audio and len(clips) < save_samples:
+                clips.append({"sentence": sentence, "audio": audio})
+        rows.append({"sentence": sentence, "runs": runs})
+    return rows, ttfa_values, total_values, clips
+
+
+def _sample_payload(clips: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "n": index,
+            "sentence": clip["sentence"],
+            "audio_base64": base64.b64encode(clip["audio"]).decode("ascii"),
+        }
+        for index, clip in enumerate(clips)
+    ]
+
+
+def _cloudtts_auth(settings: Settings, streaming: bool) -> tuple[Any, str, str, list[str]]:
+    """Service-account token, or the API-key fallback when streaming is off.
+
+    Returns credentials, bearer token, API key, and values that must be
+    redacted. The API key is not returned once a token exists.
+    """
+    raw = (settings.google_tts_credentials_json or "").strip()
+    fallback = (settings.google_tts_api_key or "").strip()
+    if raw:
+        credentials = cloudtts_credentials(raw)
+        token = credentials.token if isinstance(credentials.token, str) else ""
+        return credentials, token, "", _credential_secrets(raw, token, fallback)
+    if fallback and not streaming:
+        return None, "", fallback, [fallback]
+    raise APIError(400, "not_configured", "GOOGLE_TTS_CREDENTIALS_JSON not set")
+
+
 @router.post("/probe/tts")
 async def probe_tts(request: Request) -> dict[str, Any]:
     require_bearer(request)
@@ -546,45 +867,45 @@ async def probe_tts(request: Request) -> dict[str, Any]:
         except json.JSONDecodeError as exc:
             raise APIError(422, "invalid_body", "Body must be JSON.") from exc
     options = _parse_probe_body(payload)
+    if options["streaming"] and options["provider"] != "cloudtts":
+        raise APIError(422, "invalid_body", "streaming is only supported for provider cloudtts.")
+    credentials: Any = None
+    token = ""
+    api_key = ""
+    secrets: list[str] = []
     if options["provider"] == "cloudtts":
-        if not settings.google_tts_api_key:
-            raise APIError(400, "not_configured", "GOOGLE_TTS_API_KEY not set")
+        credentials, token, api_key, secrets = await asyncio.to_thread(
+            _cloudtts_auth,
+            settings,
+            options["streaming"],
+        )
     elif not settings.gemini_api_key:
         raise APIError(503, "not_configured", "GEMINI_API_KEY not set")
-    rows: list[dict[str, Any]] = []
-    ttfa_values: list[float] = []
-    total_values: list[float] = []
-    clips: list[dict[str, Any]] = []
-    for sentence in options["sentences"]:
-        runs: list[dict[str, Any]] = []
-        for _ in range(options["runs_per_sentence"]):
-            if options["provider"] == "cloudtts":
-                body = cloudtts_body(sentence, options["voice"])
-                result = await synthesize_cloudtts(settings.google_tts_api_key, body)
-            else:
-                body = interaction_body(
-                    sentence,
-                    model=options["model"],
-                    style=options["style"],
-                    voice=options["voice"],
-                )
-                result = await synthesize(settings.gemini_api_key, body)
-            audio: bytes = result["audio"]
-            row = {
-                "ttfa_ms": result["ttfa_ms"],
-                "total_ms": result["total_ms"],
-                "conversion_ms": result.get("conversion_ms", 0.0),
-                "audio_bytes": len(audio),
-                "audio_seconds": len(audio) / SAMPLE_RATE,
-                "error": result["error"],
-            }
-            runs.append(row)
-            if result["ttfa_ms"] is not None and result["error"] is None:
-                ttfa_values.append(result["ttfa_ms"])
-                total_values.append(result["total_ms"])
-            if audio and len(clips) < options["save_samples"]:
-                clips.append({"sentence": sentence, "audio": audio})
-        rows.append({"sentence": sentence, "runs": runs})
+
+    async def synthesize_one(sentence: str) -> dict[str, Any]:
+        if options["provider"] == "cloudtts":
+            return await synthesize_cloudtts(
+                cloudtts_body(sentence, options["voice"]),
+                token=token,
+                api_key=api_key,
+                secrets=secrets,
+            )
+        return await synthesize(
+            settings.gemini_api_key,
+            interaction_body(
+                sentence,
+                model=options["model"],
+                style=options["style"],
+                voice=options["voice"],
+            ),
+        )
+
+    rows, ttfa_values, total_values, clips = await _collect_runs(
+        options["sentences"],
+        options["runs_per_sentence"],
+        options["save_samples"],
+        synthesize_one,
+    )
     request.app.state.tts_probe_clips = clips
     reported = {
         "provider": options["provider"],
@@ -596,17 +917,33 @@ async def probe_tts(request: Request) -> dict[str, Any]:
         "sentences": rows,
         "ttfa_ms": timing_summary(ttfa_values),
         "total_ms": timing_summary(total_values),
-        "samples": [
-            {
-                "n": index,
-                "sentence": clip["sentence"],
-                "audio_base64": base64.b64encode(clip["audio"]).decode("ascii"),
-            }
-            for index, clip in enumerate(clips)
-        ],
+        "samples": _sample_payload(clips),
     }
     if options["provider"] == "cloudtts":
         reported["language_code"] = CLOUD_TTS_LANGUAGE
+        if options["streaming"]:
+            async def synthesize_stream(sentence: str) -> dict[str, Any]:
+                return await asyncio.to_thread(
+                    synthesize_cloudtts_streaming,
+                    credentials,
+                    sentence,
+                    options["voice"],
+                    secrets,
+                )
+
+            stream_rows, stream_ttfa, stream_total, stream_clips = await _collect_runs(
+                options["sentences"],
+                options["runs_per_sentence"],
+                options["save_samples"],
+                synthesize_stream,
+            )
+            reported["streaming"] = {
+                "method": CLOUD_TTS_STREAM_METHOD,
+                "sentences": stream_rows,
+                "ttfa_ms": timing_summary(stream_ttfa),
+                "total_ms": timing_summary(stream_total),
+                "samples": _sample_payload(stream_clips),
+            }
     else:
         reported["model"] = options["model"]
         reported["style"] = options["style"]
