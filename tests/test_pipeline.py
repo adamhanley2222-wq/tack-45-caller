@@ -226,19 +226,35 @@ def test_stt_notices_map_activity_and_finals():
     assert notices_from_stt(final) == [SttNotice(text="Yes this is Sam.", is_final=True, interim=False)]
 
 
-def test_speech_end_waits_for_the_final_and_does_not_double_reply():
+def test_pipeline_latency_defaults(tmp_path):
+    settings = _pipeline_settings(tmp_path)
+    assert settings.pipeline_stt_endpoint_ms == 250
+    assert settings.pipeline_llm_thinking_budget == 0
+
+
+def test_speech_end_starts_the_turn_and_a_later_final_does_not_double():
     turns = PipelineTurns()
     assert turns.push(SttNotice(speech_ended=True)) == (False, None)
-    assert turns.push(SttNotice(text="Yes", interim=True)) == (False, None)
-    started, text = turns.push(SttNotice(text="Yes this is Sam.", is_final=True))
-    assert started is False
-    assert text == "Yes this is Sam."
+    assert turns.push(SttNotice(text="Yes", interim=True)) == (False, "Yes")
+    assert turns.push(SttNotice(text="Yes this is Sam.", is_final=True)) == (False, None)
     assert turns.push(SttNotice(speech_ended=True)) == (False, None)
-    started, _text = turns.push(SttNotice(speech_started=True))
+    started, text = turns.push(SttNotice(speech_started=True))
     assert started is True
+    assert text is None
     assert turns.push(SttNotice(is_final=True)) == (False, None)
-    started, _text = turns.push(SttNotice(speech_started=True))
+    started, text = turns.push(SttNotice(speech_started=True))
     assert started is True
+    assert text is None
+
+    ready = PipelineTurns()
+    assert ready.push(SttNotice(text="Yes this is Sam.", interim=True)) == (True, None)
+    assert ready.push(SttNotice(speech_ended=True)) == (False, "Yes this is Sam.")
+    assert ready.push(SttNotice(text="Yes this is Sam.", is_final=True)) == (False, None)
+    assert ready.push(SttNotice(text="Sam.", is_final=True)) == (False, None)
+    assert ready.push(SttNotice(text="Sounds good.", is_final=True)) == (False, "Sounds good.")
+
+    alone = PipelineTurns()
+    assert alone.push(SttNotice(text="Yes.", is_final=True)) == (False, "Yes.")
 
 
 def test_outbound_opener_waits_for_hello_then_silence(caplog):
@@ -347,9 +363,22 @@ class MemoryStore:
         self.events.append("opt_out")
         self.opt_outs.append(kwargs)
 
-    async def finish_call(self, call_id: str, *, end_reason: str, transcript: list[dict], status: str) -> None:
+    async def finish_call(
+        self,
+        call_id: str,
+        *,
+        end_reason: str,
+        transcript: list[dict],
+        status: str,
+        turn_latencies=None,
+    ) -> None:
         self.events.append("finish")
-        self.finished = {"end_reason": end_reason, "transcript": transcript, "status": status}
+        self.finished = {
+            "end_reason": end_reason,
+            "transcript": transcript,
+            "status": status,
+            "turn_latencies": turn_latencies,
+        }
 
     async def mark_in_progress(self, call_id: str) -> None:
         self.in_progress = True
@@ -532,17 +561,19 @@ async def test_turn_latency_clause_flush_and_barge_in(tmp_path, caplog):
     assert opener["mark"]["name"].startswith("opener-")
     await _until(lambda: controller.protecting_opener is False)
 
-    await listener.push(SttNotice(speech_ended=True), at=1.0)
-    await listener.push(SttNotice(text="Yes", interim=True), at=1.1)
+    await listener.push(SttNotice(text="Yes this is Sam.", interim=True), at=0.4)
     await asyncio.sleep(0.05)
     assert model.calls == []
-    await listener.push(SttNotice(text="Yes this is Sam.", is_final=True), at=1.2)
+    await listener.push(SttNotice(speech_ended=True), at=1.0)
     await _until(lambda: any(text.startswith("Thanks for calling") for text in sink.texts))
     await _until(lambda: "tts_audio_ms=800" in caplog.text)
+    await listener.push(SttNotice(text="Yes this is Sam.", is_final=True), at=1.4)
+    await asyncio.sleep(0.05)
+    assert len(model.calls) == 1
 
     assert sink.texts[0] == "Hi, is this Sam?"
     assert sink.texts[1] == "Thanks for calling,"
-    assert "stt_final_ms=200" in caplog.text
+    assert "stt_final_ms=0" in caplog.text
     assert "llm_token_ms=500" in caplog.text
     assert "tts_audio_ms=800" in caplog.text
     assert caplog.text.count("Pipeline turn latency") == 1
@@ -560,6 +591,10 @@ async def test_turn_latency_clause_flush_and_barge_in(tmp_path, caplog):
     await twilio.inject({"event": "stop", "streamSid": "MZ1"})
     await asyncio.wait_for(task, 2)
     assert store.finished["end_reason"] == "caller_hangup"
+    assert store.finished["turn_latencies"][0]["speech_to_audio_ms"] == 800
+    assert store.finished["turn_latencies"][0]["stt_ms"] == 0
+    assert store.finished["turn_latencies"][0]["llm_ms"] == 500
+    assert store.finished["turn_latencies"][0]["tts_ms"] == 800
     assert store.voice == "en-AU-Chirp3-HD-Charon"
     assert store.in_progress is True
     assert gateway.hungup == []
@@ -695,10 +730,69 @@ async def test_google_stt_reopens_after_a_final_and_keeps_buffered_audio(caplog)
         assert client.streams == [[b"yes-audio"], [b"next-audio"]]
         assert stt.restarts >= 1
         assert "Pipeline STT stream restarting" in caplog.text
-        assert "reason=ended" in caplog.text
+        assert "reason=preopened" in caplog.text
+        assert "reason=ended" not in caplog.text
         assert "FAKE-CLOUD-TTS-PRIVATE-KEY-SECRET" not in caplog.text
         assert stt.closed is False
     finally:
+        await stt.close()
+
+
+class HoldingStreams:
+    """The first stream yields a final and stays open, the way Cloud Speech does."""
+
+    def __init__(self) -> None:
+        import threading
+
+        self.release = threading.Event()
+        self.second_started = threading.Event()
+        self.streams: list[list[bytes]] = []
+        self.attempts = 0
+        self._lock = threading.Lock()
+
+    def streaming_recognize(self, requests):
+        with self._lock:
+            self.attempts += 1
+            attempt = self.attempts
+        if attempt >= 2:
+            self.second_started.set()
+        try:
+            next(requests)
+            chunk = next(requests)
+        except StopIteration:
+            return
+        audio = bytes(chunk.audio)
+        with self._lock:
+            self.streams.append([audio])
+        if attempt == 1:
+            yield _stt_final("Yes.")
+            self.release.wait(timeout=5)
+            return
+        yield _stt_final("Sounds good.")
+
+
+async def test_google_stt_preopens_the_next_stream_before_the_old_one_ends():
+    import asyncio
+
+    client = HoldingStreams()
+    stt = _google_stt(client)
+    await stt.connect()
+    try:
+        await stt.send_audio(b"yes-audio")
+        first = await asyncio.wait_for(stt.recv(), 2)
+        assert first is not None
+        assert first.text == "Yes."
+        opened = await asyncio.to_thread(client.second_started.wait, 2)
+        assert opened is True
+        assert client.attempts >= 2
+        assert client.streams == [[b"yes-audio"]]
+        await stt.send_audio(b"next-audio")
+        second = await asyncio.wait_for(stt.recv(), 2)
+        assert second is not None
+        assert second.text == "Sounds good."
+        assert client.streams == [[b"yes-audio"], [b"next-audio"]]
+    finally:
+        client.release.set()
         await stt.close()
 
 
@@ -831,7 +925,13 @@ def test_invalid_service_account_json_message_has_no_secret():
 
 async def test_text_model_streams_and_redacts_the_key(tmp_path, monkeypatch):
     secret = "gem-secret-do-not-log"
-    settings = _pipeline_settings(tmp_path, gemini_api_key=secret, pipeline_llm_model="gemini-2.5-flash")
+    settings = _pipeline_settings(
+        tmp_path,
+        gemini_api_key=secret,
+        gemini_thinking_budget=-1,
+        pipeline_llm_thinking_budget=0,
+        pipeline_llm_model="gemini-2.5-flash",
+    )
     seen: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -862,6 +962,164 @@ async def test_text_model_streams_and_redacts_the_key(tmp_path, monkeypatch):
     assert "end_call" in names and "record_opt_out" in names
     assert events[0].rate_limited is True
     assert secret not in (events[0].error or "")
+    assert seen["body"]["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+
+
+async def test_text_model_streams_the_first_token_with_thinking_off(tmp_path, monkeypatch):
+    secret = "gem-secret-do-not-log"
+    settings = _pipeline_settings(
+        tmp_path,
+        gemini_api_key=secret,
+        gemini_thinking_budget=-1,
+        pipeline_llm_thinking_budget=0,
+        pipeline_llm_model="gemini-2.5-flash",
+    )
+    seen: dict = {}
+    mode = {"omit": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        if mode["omit"]:
+            seen["omitted"] = body
+            return httpx.Response(200, text="data: [DONE]\n\n")
+        seen["url"] = str(request.url)
+        seen["body"] = body
+        payload = json.dumps(
+            {"candidates": [{"content": {"parts": [{"text": "Hi"}]}}]}
+        )
+        return httpx.Response(200, text=f"data: {payload}\n\n")
+
+    transport = httpx.MockTransport(handler)
+
+    class _Client(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr("app.pipeline.httpx.AsyncClient", _Client)
+    events = []
+    async for event in PipelineTextModel(settings).stream_reply(
+        instructions="Be brief.",
+        transcript=[{"role": "caller", "text": "Yes"}],
+    ):
+        events.append(event)
+    assert "gemini-2.5-flash:streamGenerateContent" in seen["url"]
+    assert "alt=sse" in seen["url"]
+    assert seen["body"]["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+    assert events[0].text == "Hi"
+
+    settings.pipeline_llm_thinking_budget = -1
+    mode["omit"] = True
+    async for _event in PipelineTextModel(settings).stream_reply(
+        instructions="Be brief.",
+        transcript=[{"role": "caller", "text": "Yes"}],
+    ):
+        pass
+    assert "thinkingConfig" not in seen["omitted"]["generationConfig"]
+
+
+def test_speech_and_tts_clients_are_reused_and_warmed(monkeypatch, caplog):
+    from types import SimpleNamespace
+
+    caplog.set_level(logging.WARNING, logger="tack45.pipeline")
+    created = {"speech": 0, "tts": 0}
+    secret = "FAKE-CLOUD-TTS-PRIVATE-KEY-SECRET"
+
+    class Speech:
+        def __init__(self, credentials=None, client_options=None):
+            created["speech"] += 1
+            self.credentials = credentials
+            self.transport = SimpleNamespace(grpc_channel=object())
+
+    class Tts:
+        def __init__(self, credentials=None):
+            created["tts"] += 1
+            self.credentials = credentials
+            self.transport = SimpleNamespace(grpc_channel=object())
+
+    monkeypatch.setattr("google.cloud.speech_v2.SpeechClient", Speech)
+    monkeypatch.setattr("google.cloud.texttospeech.TextToSpeechClient", Tts)
+    from app.pipeline import _speech_client, _speech_clients, _tts_client, _tts_clients, warm_pipeline_channels
+
+    creds = object()
+    try:
+        assert _speech_client(creds, "global") is _speech_client(creds, "global")
+        assert _speech_client(creds, "us") is not _speech_client(creds, "global")
+        assert created["speech"] == 2
+        assert _tts_client(creds) is _tts_client(creds)
+        assert created["tts"] == 1
+
+        class Future:
+            def result(self, timeout=None):
+                raise RuntimeError(f"unavailable {secret}")
+
+        monkeypatch.setattr("grpc.channel_ready_future", lambda channel: Future())
+        warm_pipeline_channels(creds, "global", secrets=[secret])
+        assert secret not in caplog.text
+        assert "Pipeline channel warm-up failed" in caplog.text
+    finally:
+        _speech_clients.clear()
+        _tts_clients.clear()
+
+
+async def test_first_twilio_frame_is_not_held_for_a_full_20ms(tmp_path):
+    import asyncio
+
+    clock = Clock()
+    gate = asyncio.Event()
+
+    class ShortSpeaker:
+        def __init__(self) -> None:
+            self._audio: asyncio.Queue = asyncio.Queue()
+
+        def start(self) -> None:
+            return None
+
+        async def send_text(self, text: str) -> None:
+            await self._audio.put(b"\x7f" * 40)
+            await gate.wait()
+            await self._audio.put(b"\xff" * 160)
+
+        async def finish(self) -> None:
+            await self._audio.put(None)
+
+        def cancel(self) -> None:
+            self._audio.put_nowait(None)
+
+        async def chunks(self):
+            while True:
+                item = await self._audio.get()
+                if item is None:
+                    return
+                yield item
+
+    twilio = MemoryTwilio()
+    task = asyncio.create_task(
+        run_pipeline(
+            twilio_ws=twilio,
+            settings=_run_settings(tmp_path),
+            controller=_controller(clock, hold=False),
+            store=MemoryStore(),
+            gateway=MemoryGateway(),
+            listener=FakeStt(clock),
+            text_model=ScriptModel(clock),
+            tts_factory=ShortSpeaker,
+        )
+    )
+    try:
+        await twilio.inject({"event": "connected"})
+        await twilio.inject(START)
+        media = await _next(twilio, "media")
+        assert len(base64.b64decode(media["media"]["payload"])) == 40
+        gate.set()
+        rest = await _next(twilio, "media")
+        assert len(base64.b64decode(rest["media"]["payload"])) == 160
+        await twilio.inject({"event": "stop", "streamSid": "MZ1"})
+        await asyncio.wait_for(task, 2)
+    finally:
+        gate.set()
+        if not task.done():
+            task.cancel()
 
 
 def test_pipeline_answer_does_not_open_a_realtime_socket(tmp_path, twilio_capture, monkeypatch):

@@ -107,6 +107,8 @@ class CallRow(Base):
     stream_open: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     # One successful claim per call, so the transcript webhook is posted once.
     transcript_posted: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    # Per-turn pipeline latency. Empty for every other voice provider.
+    turn_latency_json: Mapped[str] = mapped_column(Text, default="[]", server_default=text("'[]'"))
 
 
 class OptOutRow(Base):
@@ -163,6 +165,18 @@ def _iso(value: datetime | None) -> str | None:
     return aware.isoformat()
 
 
+def _turn_latencies(raw: Any) -> list:
+    if isinstance(raw, list):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def call_to_dict(row: CallRow) -> dict[str, Any]:
     try:
         transcript = json.loads(row.transcript_json or "[]")
@@ -202,6 +216,7 @@ def call_to_dict(row: CallRow) -> dict[str, Any]:
         "stream_pending": bool(row.stream_pending),
         "stream_open": bool(row.stream_open),
         "transcript_posted": bool(row.transcript_posted),
+        "turn_latencies": _turn_latencies(getattr(row, "turn_latency_json", "[]")),
     }
 
 
@@ -226,6 +241,7 @@ def public_call(row: dict[str, Any], *, include_stream_token: bool = False) -> d
         "opted_out": row["opted_out"],
         "opt_out_reason": row["opt_out_reason"],
         "transcript": row["transcript"],
+        "turn_latencies": _turn_latencies(row.get("turn_latencies")),
         "duration_seconds": row["duration_seconds"],
         "created_at": row["created_at"],
         "answered_at": row["answered_at"],
@@ -289,6 +305,7 @@ def webhook_payload(row: dict[str, Any]) -> dict[str, Any]:
         "answered_at": row["answered_at"],
         "ended_at": row["ended_at"],
         "transcript": row["transcript"],
+        "turn_latencies": _turn_latencies(row.get("turn_latencies")),
     }
 
 
@@ -301,6 +318,7 @@ _ADDED_CALL_COLUMNS = {
     "brief": "TEXT NOT NULL DEFAULT ''",
     "provider_voice": "VARCHAR(128)",
     "provider_session_id": "VARCHAR(128)",
+    "turn_latency_json": "TEXT NOT NULL DEFAULT '[]'",
 }
 
 
@@ -650,6 +668,7 @@ class Database:
         end_reason: str,
         transcript: list[dict[str, Any]],
         status: str = "completed",
+        turn_latencies: list | None = None,
     ) -> None:
         async with self._begin() as session:
             row = await session.get(CallRow, call_id)
@@ -663,6 +682,8 @@ class Database:
                 end_reason = row.end_reason
             row.end_reason = end_reason or row.end_reason
             row.transcript_json = json.dumps(transcript)
+            if turn_latencies is not None:
+                row.turn_latency_json = json.dumps(turn_latencies)
             row.ended_at = as_utc(row.ended_at) or _utcnow()
             answered = as_utc(row.answered_at)
             if answered and row.duration_seconds is None:

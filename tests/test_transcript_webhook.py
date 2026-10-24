@@ -44,6 +44,7 @@ PAYLOAD_KEYS = {
     "answered_at",
     "ended_at",
     "transcript",
+    "turn_latencies",
 }
 
 
@@ -303,6 +304,7 @@ async def test_new_columns_are_added_to_an_existing_calls_table(tmp_path):
             "transcript_posted",
             "provider_voice",
             "provider_session_id",
+            "turn_latency_json",
         } <= names
         created = await _seed(db, id="legacy", stream_token="token-legacy", call_sid="CALEGACY")
         assert created["transcript_posted"] is False
@@ -310,6 +312,44 @@ async def test_new_columns_are_added_to_an_existing_calls_table(tmp_path):
         assert claimed is not None
         assert claimed["status"] == "completed"
         assert await db.claim_transcript_webhook("legacy") is None
+    finally:
+        await db.dispose()
+
+
+async def test_turn_latencies_stay_on_the_call_and_the_webhook(tmp_path):
+    settings = make_settings(tmp_path, transcript_webhook_url="https://hooks.example/calls")
+    db = Database(settings)
+    await db.connect()
+    client = FakeClient([FakeResponse(204)])
+    turns = [{"speech_to_audio_ms": 800, "stt_ms": 0, "llm_ms": 500, "tts_ms": 800}]
+    try:
+        await _seed(db, status="in-progress")
+        await db.finish_call(
+            "call-1",
+            end_reason="caller_hangup",
+            transcript=[{"role": "caller", "text": "Yes"}],
+            status="completed",
+            turn_latencies=turns,
+        )
+        await db.finish_call(
+            "call-1",
+            end_reason="caller_hangup",
+            transcript=[{"role": "caller", "text": "Yes"}],
+            status="completed",
+        )
+        stored = await db.get("call-1")
+        assert stored["turn_latencies"] == turns
+        shown = public_call(stored)
+        assert shown["turn_latencies"] == turns
+        await db.mark_stream_closed("call-1")
+        await deliver_transcript(
+            _app(db, client, settings),
+            "call-1",
+            attach_grace=0,
+            retry_delays=(),
+            sleep=_no_sleep,
+        )
+        assert client.calls[0]["json"]["turn_latencies"] == turns
     finally:
         await db.dispose()
 

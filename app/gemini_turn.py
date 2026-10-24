@@ -122,14 +122,23 @@ def is_rate_limit(status: int | None, error: str | None) -> bool:
     )
 
 
-def take_sentences(buffer: str, *, flush: bool, early_clause: bool) -> tuple[list[str], str]:
+def take_sentences(
+    buffer: str,
+    *,
+    flush: bool,
+    early_clause: bool,
+    flush_trailing: bool = False,
+    early_words: int | None = None,
+) -> tuple[list[str], str]:
     """Split complete sentences out of a streaming text buffer.
 
     A boundary is ``.`` ``!`` or ``?`` followed by whitespace, or by the end of
-    the buffer when ``flush`` is set. Abbreviations and decimals stay intact.
-    ``early_clause`` is for the first chunk of a reply: a comma clause of at
-    least three words, or a hard cap of twelve words, so TTS can start before
-    a long sentence finishes generating.
+    the buffer when ``flush`` is set. ``flush_trailing`` also releases a
+    finished sentence that ends on the last character, so the pipeline can
+    speak it before the model stream closes. Abbreviations and decimals stay
+    intact. ``early_clause`` is for the first chunk of a reply: a comma clause
+    of at least three words, or a hard cap of ``early_words`` (default twelve),
+    so TTS can start before a long sentence finishes generating.
     """
     sentences: list[str] = []
     index = 0
@@ -139,7 +148,7 @@ def take_sentences(buffer: str, *, flush: bool, early_clause: bool) -> tuple[lis
         if end is None:
             break
         after = end + 1
-        if after >= length and not flush:
+        if after >= length and not flush and not flush_trailing:
             break
         piece = buffer[index:after].strip()
         if piece:
@@ -150,7 +159,8 @@ def take_sentences(buffer: str, *, flush: bool, early_clause: bool) -> tuple[lis
     if early_clause and not sentences:
         clause = _clause_end(buffer, index)
         if clause is None:
-            clause = _word_cap(buffer, index, FIRST_SENTENCE_WORDS)
+            limit = FIRST_SENTENCE_WORDS if early_words is None else early_words
+            clause = _word_cap(buffer, index, limit)
         if clause is not None:
             piece = buffer[index:clause].strip()
             if piece:

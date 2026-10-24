@@ -228,6 +228,7 @@ class TurnLatency:
     def __init__(self, clock: Callable[[], float], call_id: str) -> None:
         self.clock = clock
         self.call_id = call_id
+        self.turns: list[dict[str, int | None]] = []
         self.reset()
 
     def reset(self) -> None:
@@ -240,6 +241,14 @@ class TurnLatency:
     def speech_ended(self) -> None:
         if self.speech_ended_at is None:
             self.speech_ended_at = self.clock()
+
+    def heard(self) -> None:
+        """The transcript that actually started the reply, not a late final."""
+        now = self.clock()
+        if self.speech_ended_at is None:
+            self.speech_ended_at = now
+        if self.stt_final_at is None:
+            self.stt_final_at = now
 
     def stt_final(self) -> None:
         now = self.clock()
@@ -257,10 +266,25 @@ class TurnLatency:
             self.tts_audio_at = self.clock()
             self.log()
 
+    def _ms(self, end: float | None) -> int | None:
+        if self.speech_ended_at is None or end is None:
+            return None
+        return max(0, int(round((end - self.speech_ended_at) * 1000)))
+
+    def summary(self) -> dict[str, int | None]:
+        audio = self._ms(self.tts_audio_at)
+        return {
+            "speech_to_audio_ms": audio,
+            "stt_ms": self._ms(self.stt_final_at),
+            "llm_ms": self._ms(self.llm_token_at),
+            "tts_ms": audio,
+        }
+
     def log(self) -> None:
         if self.logged or self.speech_ended_at is None:
             return
         self.logged = True
+        self.turns.append(self.summary())
         logger.info(
             "Pipeline turn latency call=%s stt_final_ms=%s llm_token_ms=%s tts_audio_ms=%s",
             self.call_id,
@@ -270,38 +294,67 @@ class TurnLatency:
         )
 
 
-class PipelineTurns:
-    """Interim text barges in. Only a final transcript starts the reply.
+def _utterance_words(text: str) -> list[str]:
+    cleaned = "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in text)
+    return cleaned.split()
 
-    Speech-end marks the latency origin and ignores a trailing interim that
-    arrives before that final. It does not start a second reply.
+
+def _phrase_in(haystack: list[str], needle: list[str]) -> bool:
+    if not needle or len(needle) > len(haystack):
+        return False
+    width = len(needle)
+    return any(haystack[index : index + width] == needle for index in range(len(haystack) - width + 1))
+
+
+class PipelineTurns:
+    """Interim text barges in. Voice-activity end starts the reply.
+
+    A speech-end with interim text, or the next interim after that end,
+    starts the reply. The later final for that same utterance does not.
+    A final that arrives on its own still starts the reply. A tail the next
+    Speech-to-Text stream transcribes from the same words is ignored.
     """
 
     def __init__(self) -> None:
         self._interim = ""
         self._final = ""
+        self._spoken = ""
         self._talking = False
         self._closing = False
         self._emitted = False
 
     def push(self, notice: SttNotice) -> tuple[bool, str | None]:
         if notice.speech_started:
-            if self._closing:
+            if self._closing and not self._emitted:
                 return False, None
+            self._closing = False
             started = not self._talking
             self._talking = True
             self._arm()
             return started, None
         if notice.interim and notice.text:
-            if self._closing:
-                self._interim = notice.text
+            if self._emitted and not self._talking and (self._closing or self._repeats(notice.text)):
                 return False, None
+            if self._closing and not self._emitted:
+                self._interim = notice.text
+                return False, self._take()
             started = not self._talking
             self._talking = True
             self._arm()
             self._interim = notice.text
             return started, None
         if notice.is_final:
+            if self._emitted and self._closing:
+                self._closing = False
+                self._talking = False
+                self._interim = ""
+                self._final = ""
+                return False, None
+            if self._emitted and not self._talking and self._repeats(notice.text):
+                self._closing = False
+                self._interim = ""
+                self._final = ""
+                return False, None
             self._closing = False
             self._talking = False
             if not notice.text:
@@ -311,18 +364,28 @@ class PipelineTurns:
             self._interim = ""
             return False, self._take()
         if notice.speech_ended:
-            # A late end after the final must not swallow the next utterance.
+            # A late end after the reply started must not swallow the next utterance.
             if self._emitted and not self._talking and not self._interim:
                 return False, None
             self._talking = False
             self._closing = True
+            if self._interim and not self._emitted:
+                return False, self._take()
         return False, None
+
+    def _repeats(self, text: str) -> bool:
+        new = _utterance_words(text)
+        old = _utterance_words(self._spoken)
+        if not new or not old:
+            return False
+        return new == old or _phrase_in(old, new) or _phrase_in(new, old)
 
     def _arm(self) -> None:
         if self._emitted:
             self._emitted = False
             self._final = ""
             self._interim = ""
+            self._spoken = ""
 
     def _take(self) -> str | None:
         if self._emitted:
@@ -333,6 +396,7 @@ class PipelineTurns:
         if not text:
             return None
         self._emitted = True
+        self._spoken = text
         return text
 
 
@@ -433,7 +497,7 @@ class PipelineTextModel:
         self.settings = settings
 
     async def stream_reply(self, *, instructions: str, transcript: list[dict]) -> AsyncIterator[ModelEvent]:
-        body = text_request(instructions, transcript, self.settings)
+        body = apply_pipeline_thinking(text_request(instructions, transcript, self.settings), self.settings)
         url = _GENERATE.format(model=self.settings.pipeline_llm_model)
         secret = self.settings.gemini_api_key
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -470,6 +534,21 @@ class PipelineTextModel:
                 yield ModelEvent(rate_limited=is_rate_limit(None, message), error=message)
 
 
+def apply_pipeline_thinking(body: dict, settings: Settings) -> dict:
+    """Force the pipeline thinking budget. The cascade setting does not apply.
+
+    gemini-2.5-flash thinks before the first token unless thinkingBudget is 0.
+    A negative PIPELINE_LLM_THINKING_BUDGET omits the field.
+    """
+    budget = settings.pipeline_llm_thinking_budget
+    generation = body.setdefault("generationConfig", {})
+    if isinstance(budget, int) and not isinstance(budget, bool) and budget >= 0:
+        generation["thinkingConfig"] = {"thinkingBudget": budget}
+    else:
+        generation.pop("thinkingConfig", None)
+    return body
+
+
 def _sse_json(line: str) -> Any:
     text = line.strip()
     if not text or text.startswith(":"):
@@ -484,13 +563,31 @@ def _sse_json(line: str) -> Any:
         return None
 
 
+_client_lock = threading.Lock()
+_speech_clients: dict[tuple[int, str], Any] = {}
+_tts_clients: dict[int, Any] = {}
+
+
 def _speech_client(credentials: Any, location: str) -> Any:
+    """One Speech client per credentials object and location. The channel is reused."""
+    place = (location or "global").strip() or "global"
+    key = (id(credentials), place)
+    with _client_lock:
+        cached = _speech_clients.get(key)
+        if cached is not None:
+            return cached
     from google.api_core.client_options import ClientOptions
     from google.cloud.speech_v2 import SpeechClient
 
-    endpoint = speech_api_endpoint(location)
+    endpoint = speech_api_endpoint(place)
     options = ClientOptions(api_endpoint=endpoint) if endpoint else None
-    return SpeechClient(credentials=credentials, client_options=options)
+    client = SpeechClient(credentials=credentials, client_options=options)
+    with _client_lock:
+        existing = _speech_clients.get(key)
+        if existing is not None:
+            return existing
+        _speech_clients[key] = client
+        return client
 
 
 class _AudioBuffer:
@@ -547,9 +644,11 @@ class GoogleStt:
     """StreamingRecognize for the whole call.
 
     Cloud Speech closes a stream after a final result, on endpointing, at the
-    roughly five-minute limit, or on a transient error. This opens another
-    stream and keeps audio queued across the gap. ``recv`` returns None only
-    after ``close``. Nothing from the service-account key is logged.
+    roughly five-minute limit, or on a transient error. The next stream is
+    opened when speech ends or a final arrives, while the old RPC is still
+    up, so the gap is not paid at the start of the next turn. Audio stays
+    queued across that handoff. ``recv`` returns None only after ``close``.
+    Nothing from the service-account key is logged.
     """
 
     def __init__(
@@ -576,15 +675,23 @@ class GoogleStt:
         self._client_factory = client_factory or _speech_client
         self._buffer = _AudioBuffer()
         self._events: queue.Queue[SttNotice | None] = queue.Queue()
-        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._threads: list[threading.Thread] = []
+        self._stop: threading.Event | None = None
+        self._client: Any = None
+        self._live = False
+        self._generation = 0
+        self._error_streak = 0
         self.closed = False
         self.restarts = 0
 
     async def connect(self) -> None:
         if not self._project_id:
             raise RuntimeError("Service account JSON has no project_id.")
-        self._thread = threading.Thread(target=self._run, name="pipeline-stt", daemon=True)
-        self._thread.start()
+        thread = threading.Thread(target=self._bootstrap, name="pipeline-stt", daemon=True)
+        with self._lock:
+            self._threads.append(thread)
+        thread.start()
 
     async def send_audio(self, payload: bytes) -> None:
         self._buffer.add(payload)
@@ -597,9 +704,15 @@ class GoogleStt:
             return
         self.closed = True
         self._buffer.close()
-        thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            await asyncio.to_thread(thread.join, 2.0)
+        with self._lock:
+            stop = self._stop
+            threads = list(self._threads)
+        if stop is not None:
+            stop.set()
+        self._buffer.wake()
+        for thread in threads:
+            if thread is not threading.current_thread():
+                await asyncio.to_thread(thread.join, 2.0)
         self._events.put(None)
 
     def _chunks(self, stop: threading.Event) -> Iterator[bytes]:
@@ -629,59 +742,173 @@ class GoogleStt:
             _redact(str(exc), *self._secrets),
         )
 
-    def _run(self) -> None:
-        client = None
-        error_streak = 0
+    def _backoff(self) -> float:
+        self._error_streak += 1
+        return min(2.0, 0.05 * (2 ** min(self._error_streak, 5)))
+
+    def _bootstrap(self) -> None:
+        while not self._buffer.closed:
+            try:
+                self._client = self._client_factory(self._credentials, self._location)
+                break
+            except Exception as exc:
+                self._log_restart("client", exc)
+                self._buffer.wait_closed(self._backoff())
+        if self._buffer.closed or self._client is None:
+            return
+        self._start_session(None, None, 0.0)
+
+    def _start_session(
+        self,
+        reason: str | None,
+        exc: BaseException | None,
+        backoff: float,
+    ) -> bool:
+        with self._lock:
+            if self.closed or self._buffer.closed or self._live:
+                return False
+            self._live = True
+            self._generation += 1
+            generation = self._generation
+        thread = threading.Thread(
+            target=self._session,
+            args=(generation, reason, exc, backoff),
+            name="pipeline-stt",
+            daemon=True,
+        )
+        with self._lock:
+            self._threads.append(thread)
+        thread.start()
+        return True
+
+    def _release(self, generation: int) -> None:
+        with self._lock:
+            if self._generation == generation:
+                self._live = False
+
+    def _session(
+        self,
+        generation: int,
+        reason: str | None,
+        exc: BaseException | None,
+        backoff: float,
+    ) -> None:
+        if backoff > 0:
+            self._buffer.wait_closed(backoff)
+        if self._buffer.closed:
+            self._release(generation)
+            return
+        if reason:
+            self._log_restart(reason, exc)
+        stop = threading.Event()
+        with self._lock:
+            if self._generation == generation:
+                self._stop = stop
+        handed_off = False
+        got_response = False
+        stream_exc: BaseException | None = None
         try:
-            while not self._buffer.closed:
-                if client is None:
-                    try:
-                        client = self._client_factory(self._credentials, self._location)
-                    except Exception as exc:
-                        self._log_restart("client", exc)
-                        error_streak += 1
-                        self._buffer.wait_closed(min(2.0, 0.05 * (2 ** min(error_streak, 5))))
-                        continue
-                stop = threading.Event()
-                got_response = False
-                exc: BaseException | None = None
-                try:
-                    requests = recognize_requests(
-                        self._project_id,
-                        self._location,
-                        self._language,
-                        self._model,
-                        self._endpoint_ms,
-                        self._chunks(stop),
-                    )
-                    for response in client.streaming_recognize(requests=requests):
-                        if self._buffer.closed:
-                            break
-                        got_response = True
-                        for notice in notices_from_stt(response):
-                            self._events.put(notice)
-                except Exception as stream_exc:
-                    exc = stream_exc
-                finally:
-                    stop.set()
-                    self._buffer.wake()
+            requests = recognize_requests(
+                self._project_id,
+                self._location,
+                self._language,
+                self._model,
+                self._endpoint_ms,
+                self._chunks(stop),
+            )
+            for response in self._client.streaming_recognize(requests=requests):
                 if self._buffer.closed:
                     break
-                # A clean end is a final result, endpointing, or the stream time limit.
-                self._log_restart("error" if exc is not None else "ended", exc)
-                if got_response:
-                    error_streak = 0
-                    continue
-                error_streak += 1
-                self._buffer.wait_closed(min(2.0, 0.05 * (2 ** min(error_streak, 5))))
+                got_response = True
+                handoff = False
+                for notice in notices_from_stt(response):
+                    self._events.put(notice)
+                    if notice.speech_ended or notice.is_final:
+                        handoff = True
+                if handoff and not handed_off:
+                    # Stop feeding this stream. Keep reading it so a late final
+                    # still arrives. The next stream is already opening.
+                    stop.set()
+                    self._buffer.wake()
+                    self._release(generation)
+                    if self._start_session("preopened", None, 0.0):
+                        handed_off = True
+                    else:
+                        with self._lock:
+                            if self._generation == generation and not self.closed:
+                                self._live = True
+        except Exception as caught:
+            stream_exc = caught
         finally:
-            self._events.put(None)
+            stop.set()
+            self._buffer.wake()
+            with self._lock:
+                if self._stop is stop:
+                    self._stop = None
+            if handed_off or self._buffer.closed:
+                self._release(generation)
+                return
+            if got_response and stream_exc is None:
+                self._error_streak = 0
+                delay = 0.0
+                next_reason = "ended"
+            elif got_response:
+                self._error_streak = 0
+                delay = 0.0
+                next_reason = "error"
+            else:
+                delay = self._backoff()
+                next_reason = "error" if stream_exc is not None else "ended"
+            self._release(generation)
+            self._start_session(next_reason, stream_exc, delay)
 
 
 def _tts_client(credentials: Any) -> Any:
+    """One Text-to-Speech client per credentials object. The channel is reused."""
+    key = id(credentials)
+    with _client_lock:
+        cached = _tts_clients.get(key)
+        if cached is not None:
+            return cached
     from google.cloud import texttospeech
 
-    return texttospeech.TextToSpeechClient(credentials=credentials)
+    client = texttospeech.TextToSpeechClient(credentials=credentials)
+    with _client_lock:
+        existing = _tts_clients.get(key)
+        if existing is not None:
+            return existing
+        _tts_clients[key] = client
+        return client
+
+
+def _warm_channel(client: Any, secrets: list[str]) -> None:
+    transport = getattr(client, "transport", None)
+    channel = getattr(transport, "grpc_channel", None)
+    if channel is None:
+        return
+    import grpc
+
+    try:
+        grpc.channel_ready_future(channel).result(timeout=5)
+    except Exception as exc:
+        logger.warning("Pipeline channel warm-up failed: %s", _redact(str(exc), *secrets))
+
+
+def warm_pipeline_channels(credentials: Any, location: str, secrets: list[str] | None = None) -> None:
+    """Open the Speech and Text-to-Speech channels before the first caller turn.
+
+    This waits until each channel is ready. It does not call recognize or
+    synthesize, so it is not a billed request. A failure is logged and ignored.
+    """
+    hidden = list(secrets or [])
+    try:
+        _warm_channel(_speech_client(credentials, location), hidden)
+    except Exception as exc:
+        logger.warning("Pipeline channel warm-up failed: %s", _redact(str(exc), *hidden))
+    try:
+        _warm_channel(_tts_client(credentials), hidden)
+    except Exception as exc:
+        logger.warning("Pipeline channel warm-up failed: %s", _redact(str(exc), *hidden))
 
 
 class CloudStreamingSpeaker:
@@ -751,9 +978,13 @@ def schedule_pipeline_auth(app, settings: Settings) -> None:
     if not raw:
         return
 
+    def _prepare() -> None:
+        credentials = cloudtts_credentials(raw)
+        warm_pipeline_channels(credentials, settings.pipeline_stt_location, _credential_secrets(raw))
+
     async def _warm() -> None:
         try:
-            await asyncio.to_thread(cloudtts_credentials, raw)
+            await asyncio.to_thread(_prepare)
         except APIError as exc:
             logger.error("Pipeline credential warm-up failed: %s", exc.message)
         except Exception as exc:
@@ -879,6 +1110,7 @@ async def run_pipeline(
                 end_reason=reason,
                 transcript=list(controller.transcript),
                 status="completed",
+                turn_latencies=list(latency.turns),
             )
         except Exception:
             logger.error("Failed to store the final call record for %s", controller.call_id)
@@ -920,7 +1152,11 @@ async def run_pipeline(
         audio_task = asyncio.create_task(forward_audio(speaker, generation), name="pipeline-audio")
 
     async def forward_audio(active, generation: int) -> None:
+        # 20 ms frames, sent as soon as they exist. Twilio plays on arrival,
+        # so sleeping to pace them would not shorten the gap before the answer.
+        # A first chunk shorter than one frame is sent immediately.
         pending = b""
+        sent_any = False
         try:
             async for chunk in active.chunks():
                 if generation != controller.generation or controller.interrupted:
@@ -929,7 +1165,21 @@ async def run_pipeline(
                 if controller.reply_active:
                     latency.tts_audio()
                 pending += chunk
+                if not sent_any and 0 < len(pending) < _FRAME:
+                    sent_any = True
+                    if not controller.note_playback(len(pending), generation) or not controller.stream_sid:
+                        return
+                    frame, pending = pending, b""
+                    await twilio_out.put(
+                        {
+                            "event": "media",
+                            "streamSid": controller.stream_sid,
+                            "media": {"payload": base64.b64encode(frame).decode("ascii")},
+                        }
+                    )
+                    continue
                 while len(pending) >= _FRAME:
+                    sent_any = True
                     if not controller.note_playback(_FRAME, generation) or not controller.stream_sid:
                         return
                     frame, pending = pending[:_FRAME], pending[_FRAME:]
@@ -1020,7 +1270,13 @@ async def run_pipeline(
                         return
                 if event.text:
                     latency.llm_token()
-                    sentences, buffer = take_sentences(buffer + event.text, flush=False, early_clause=early)
+                    sentences, buffer = take_sentences(
+                        buffer + event.text,
+                        flush=False,
+                        early_clause=early,
+                        flush_trailing=True,
+                        early_words=6,
+                    )
                     if sentences:
                         early = False
                     for sentence in sentences:
@@ -1028,7 +1284,13 @@ async def run_pipeline(
                             return
             if generation != controller.generation:
                 return
-            sentences, _rest = take_sentences(buffer, flush=True, early_clause=early)
+            sentences, _rest = take_sentences(
+                buffer,
+                flush=True,
+                early_clause=early,
+                flush_trailing=True,
+                early_words=6,
+            )
             for sentence in sentences:
                 if await dispatch(controller.on_assistant_sentence(sentence, generation)):
                     return
@@ -1145,11 +1407,12 @@ async def run_pipeline(
                     return
             if notice.speech_ended:
                 latency.speech_ended()
-            if notice.is_final and notice.text:
-                latency.stt_final()
             if text:
+                latency.heard()
                 if await dispatch(controller.on_caller_turn(text)):
                     return
+            elif notice.is_final and notice.text:
+                latency.stt_final()
 
     async def watchdog() -> None:
         while True:
