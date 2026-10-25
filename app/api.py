@@ -15,7 +15,7 @@ from app.config import Settings, missing_dial_configuration
 from app.db import FINAL_TWILIO_STATUSES, public_call
 from app import guards
 from app.phones import PhoneError, infer_timezone, normalize_phone, validate_timezone
-from app.briefs import BriefError, apply_brief, resolve_brief
+from app.briefs import BriefError, apply_brief, base_prompt_file, resolve_brief, spoken_opener
 from app.prompts import first_name_from, inbound_opener, load_text, render_instructions, render_opener
 from app.providers import SessionPlan, build_session_plan
 from app.realtime_ws import default_provider_factory
@@ -81,8 +81,12 @@ _LIVE = {"streaming", "in-progress"}
 
 def prepare_script(settings: Settings, call: dict) -> tuple[str, SessionPlan]:
     """Render the short opener and the session that speaks it."""
-    opener = render_opener(load_text(settings.opener_path), call.get("name") or "")
-    template = load_text(settings.prompt_path)
+    brief = call.get("brief") or ""
+    opener = spoken_opener(brief) or render_opener(
+        load_text(settings.opener_path), call.get("name") or ""
+    )
+    prompt_path = base_prompt_file(settings.prompt_path, brief) or settings.prompt_path
+    template = load_text(prompt_path)
     instructions = render_instructions(
         template,
         opener=opener,
@@ -201,7 +205,12 @@ async def create_call(request: Request) -> JSONResponse:
     if len(name) > 200 or len(business) > 200 or len(notes) > 2000:
         raise APIError(422, "invalid_body", "name, business, or notes is too long.")
     try:
-        brief = resolve_brief(settings.briefs_dir, payload.get("brief"), payload.get("brief_id"))
+        brief = resolve_brief(
+            settings.briefs_dir,
+            payload.get("brief"),
+            payload.get("brief_id"),
+            prompt_path=settings.prompt_path,
+        )
     except BriefError as exc:
         if exc.unknown:
             raise APIError(400, "unknown_brief", exc.message) from exc

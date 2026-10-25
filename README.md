@@ -69,11 +69,15 @@ Optional `--timezone Australia/Perth` when the number's area code is ambiguous. 
 {"to": "+61412345678", "name": "Sam Lee", "business": "Harbour Roasters", "notes": ""}
 ```
 
-`timezone` is optional. An optional `brief` string, or a `brief_id` that loads `prompts/briefs/<id>.md`, is appended to the outbound system prompt under `TARGET-SPECIFIC CALL BRIEF`. Where that brief has an opener line 2, it replaces the generic post-confirmation sentence. The spoken opener stays `Hi, is this {first name}?`. Disclosure, opt-out, honesty, and no-claims rules still apply. An unknown `brief_id` returns 400 and does not dial. Send one of `brief` or `brief_id`, not both.
+`timezone` is optional. An optional `brief` string, or a `brief_id` that loads `prompts/briefs/<id>.md`, is appended to the outbound system prompt under `TARGET-SPECIFIC CALL BRIEF`. Where that brief has an opener line 2, it replaces the generic post-confirmation sentence. The spoken opener stays `Hi, is this {first name}?`, unless the brief's front matter sets `opener`. Disclosure, opt-out, honesty, and no-claims rules still apply. An unknown `brief_id` returns 400 and does not dial. Send one of `brief` or `brief_id`, not both.
+
+A brief may start with front matter. `base_prompt: personal` uses `prompts/personal_system.txt` instead of `prompts/system.txt`, so that call does not follow the Tack45 sales script. Other briefs leave the sales prompt in place. Front matter is not read aloud.
 
 ```json
 {"to": "+61412345678", "name": "Marc Hanley", "business": "Barrenjoey Inspections", "notes": "", "brief_id": "barrenjoey-marc"}
 ```
+
+`brief_id` `mike-charter-scheduling` is a one-off scheduling call. It uses the personal prompt and does not pitch Tack45.
 
 `GET /calls/{id}` returns the AMD result, timestamps, duration, transcript, opt-out flag, and end reason.
 
