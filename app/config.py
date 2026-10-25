@@ -96,8 +96,14 @@ class Settings(BaseSettings):
     pipeline_stt_model: str = "telephony"
     pipeline_stt_language: str = "en-AU"
     pipeline_stt_location: str = "global"
-    # Silence after the caller stops before the final transcript closes the turn.
-    pipeline_stt_endpoint_ms: int = 500
+    # Silence before Cloud Speech sends voice-activity end. The pipeline
+    # starts the reply on that event, or on the next interim, rather than
+    # waiting for the final transcript. telephony in global is what accepts
+    # 8 kHz μ-law; it is not an extra wait on top of this timer.
+    pipeline_stt_endpoint_ms: int = 250
+    # Pipeline text model only. 0 turns thinking off on gemini-2.5-flash.
+    # A negative value omits thinkingConfig. This overrides GEMINI_THINKING_BUDGET.
+    pipeline_llm_thinking_budget: int = 0
     # Cascaded Gemini provider. Ignored unless VOICE_PROVIDER=gemini.
     deepgram_api_key: str = ""
     deepgram_url: str = "wss://api.deepgram.com/v1/listen"

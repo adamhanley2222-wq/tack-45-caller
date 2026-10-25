@@ -137,6 +137,27 @@ def test_first_sentence_stays_short():
     assert capped == ["one two three four five six seven eight nine ten eleven twelve"]
     assert rest == "thirteen"
 
+    sooner, rest = take_sentences(
+        "one two three four five six seven",
+        flush=False,
+        early_clause=True,
+        early_words=6,
+    )
+    assert sooner == ["one two three four five six"]
+    assert rest == "seven"
+
+    held, rest = take_sentences("Yes, now is fine.", flush=False, early_clause=True)
+    assert held == []
+    assert rest == "Yes, now is fine."
+    flushed, rest = take_sentences(
+        "Yes, now is fine.",
+        flush=False,
+        early_clause=True,
+        flush_trailing=True,
+    )
+    assert flushed == ["Yes, now is fine."]
+    assert rest == ""
+
 
 def test_spoken_text_never_includes_accent_instructions_or_tool_names():
     assert spoken_only("Thanks Sam.") == "Thanks Sam."
